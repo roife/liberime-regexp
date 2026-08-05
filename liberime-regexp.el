@@ -16,10 +16,11 @@
 ;; Evil's `evil-ex-search-full-pattern' when those functions are available.
 ;;
 ;; Candidate lookup normally uses liberime's default session so that an
-;; automatically committed prefix is retained.  By default, candidates which
-;; consume only a prefix of the supplied code are discarded.  If the default
-;; session already has an active composition, cached results remain available;
-;; an uncached code is left unexpanded so that the composition is untouched.
+;; automatically committed prefix is retained.  The shortest prefix candidates
+;; may be composed recursively, but every generated expansion must consume the
+;; complete supplied code.  If the default session already has an active
+;; composition, cached results remain available; an uncached code is left
+;; unexpanded so that the composition is untouched.
 ;;
 ;; Basic setup:
 ;;
@@ -34,16 +35,12 @@
 (declare-function liberime-load "liberime")
 (declare-function liberime-workable-p "liberime")
 (declare-function liberime-clear-composition "ext:liberime-core")
-(declare-function liberime-get-candidates "ext:liberime-core"
-                  (&optional limit index))
 (declare-function liberime-get-commit "ext:liberime-core")
 (declare-function liberime-get-context "ext:liberime-core")
 (declare-function liberime-get-input "ext:liberime-core")
 (declare-function liberime-get-status "ext:liberime-core")
 (declare-function liberime-process-key "ext:liberime-core"
                   (keycode &optional mask))
-(declare-function liberime-search "ext:liberime-core"
-                  (string &optional limit index))
 
 (defgroup liberime-regexp nil
   "Build regular expressions from Rime candidates."
@@ -67,19 +64,6 @@ recommended for incremental search because short codes can have thousands of
 candidates."
   :type '(choice (const :tag "No limit" nil)
                  (integer :tag "Maximum candidates"))
-  :group 'liberime-regexp)
-
-(defcustom liberime-regexp-require-full-code-match t
-  "Whether candidates must consume the complete Rime code.
-
-When non-nil, navigate the candidate menu without committing and keep only
-candidates whose composition selection reaches the original input end.  This
-prevents a code such as `lcdsviyu' from matching merely `老', which is a Rime
-prefix candidate for `lao dong zhi yu'.
-
-When nil, preserve liberime's complete candidate list, including candidates
-which consume only an initial part of the code."
-  :type 'boolean
   :group 'liberime-regexp)
 
 (defcustom liberime-regexp-cache-size 256
@@ -108,7 +92,7 @@ which contains the original separator can still match."
 (defconst liberime-regexp--unset (make-symbol "unset"))
 
 (defvar liberime-regexp--candidate-cache (make-hash-table :test #'equal)
-  "Cache used by `liberime-regexp-get-candidates-list'.")
+  "Cache candidate queries and their generated regexps.")
 
 (defvar liberime-regexp--saved-isearch-search-fun-function nil)
 
@@ -142,18 +126,22 @@ which contains the original separator can still match."
         (push candidate result)))
     (nreverse result)))
 
-(defun liberime-regexp--full-consumption-candidates ()
-  "Return current candidates which consume the entire Rime code.
+(defun liberime-regexp--candidate-expansions ()
+  "Return full and shortest-prefix candidates for the current Rime input.
+
+The return value is a plist with keys `:full', `:prefix', and `:remainder'.
+FULL candidates consume the input completely.  PREFIX candidates all consume
+the same shortest non-empty prefix, and REMAINDER is the unconsumed suffix.
 
 Candidate highlighting changes the composition selection without committing
-or learning a candidate.  Compare each highlighted candidate's selection end
-with the original composition length to detect prefix-only candidates."
+or learning a candidate.  Rime leaves an unselected raw-code suffix in the
+preedit for a prefix candidate."
   (let* ((context (liberime-get-context))
          (input-end (alist-get 'length (alist-get 'composition context)))
          (limit (liberime-regexp--candidate-limit))
          (seen (make-hash-table :test #'equal))
          (examined 0)
-         result)
+         full prefix remainder)
     (when input-end
       (catch 'done
         (while context
@@ -162,57 +150,74 @@ with the original composition length to detect prefix-only candidates."
                  (index (alist-get 'highlighted-candidate-index menu))
                  (candidate (and index
                                  (nth index (alist-get 'candidates menu))))
+                 (preedit (alist-get 'preedit composition))
+                 (selection-end (alist-get 'sel-end composition))
                  (state (and candidate
                              (cons (alist-get 'page-no menu) index))))
             (when (or (null state) (gethash state seen))
               (throw 'done nil))
             (puthash state t seen)
             (setq examined (1+ examined))
-            (when (equal (alist-get 'sel-end composition) input-end)
-              (push candidate result))
+            (if (equal selection-end input-end)
+                (push candidate full)
+              (let ((rest (substring preedit selection-end)))
+                ;; A longer remainder means that this candidate consumed a
+                ;; shorter prefix.  Retain only that least-consuming group so
+                ;; recursive regexp construction stays linear.
+                (unless (string-empty-p rest)
+                  (cond
+                   ((or (null remainder)
+                        (> (length rest) (length remainder)))
+                    (setq remainder rest
+                          prefix (list candidate)))
+                   ((string= rest remainder)
+                    (push candidate prefix))))))
             (when (and limit (>= examined limit))
               (throw 'done nil))
             ;; XK_Down moves the highlight, including across menu pages.
             (unless (liberime-process-key #xff54 0)
               (throw 'done nil))
             (setq context (liberime-get-context))))))
-    (liberime-regexp--normalize-candidates (nreverse result))))
-
-(defun liberime-regexp--current-candidates ()
-  "Return candidates from the current liberime session."
-  (if liberime-regexp-require-full-code-match
-      (liberime-regexp--full-consumption-candidates)
-    (liberime-regexp--normalize-candidates
-     (liberime-get-candidates (liberime-regexp--candidate-limit)))))
-
-(defun liberime-regexp--isolated-query (code)
-  "Return an isolated-session candidate result for CODE."
-  (let ((candidates
-         (liberime-regexp--normalize-candidates
-          (liberime-search code (liberime-regexp--candidate-limit)))))
-    (and candidates (cons nil candidates))))
+    (list :full (liberime-regexp--normalize-candidates (nreverse full))
+          :prefix (liberime-regexp--normalize-candidates (nreverse prefix))
+          :remainder remainder)))
 
 (defun liberime-regexp--default-session-query (code)
-  "Return commit and candidates for CODE using the default session."
-  (let (commit candidates remaining-input)
+  "Return a candidate expansion plist for CODE using the default session."
+  (let (commit expansions remaining-input)
     (unwind-protect
         (progn
           (liberime-clear-composition)
           (mapc (lambda (character)
                   (liberime-process-key character 0))
                 code)
-          (setq candidates (liberime-regexp--current-candidates)
-                commit (liberime-get-commit)
-                remaining-input (liberime-get-input)))
+          (setq remaining-input (liberime-get-input)
+                expansions
+                (and remaining-input
+                     (not (string-empty-p remaining-input))
+                     (liberime-regexp--candidate-expansions))
+                commit (liberime-get-commit)))
       (liberime-clear-composition))
-    ;; A commit without a complete residual candidate can itself be only an
-    ;; automatically committed prefix.  Keep it alone only if no input remains.
-    (when (and commit
-               (null candidates)
-               remaining-input
-               (not (string-empty-p remaining-input)))
-      (setq commit nil))
-    (and (or commit candidates) (cons commit candidates))))
+    (let ((full (plist-get expansions :full))
+          (prefix (plist-get expansions :prefix))
+          (remainder (plist-get expansions :remainder)))
+      ;; A commit followed by unusable residual input can itself be only an
+      ;; automatically committed prefix, so do not expose it as a complete
+      ;; expansion.
+      (when (and commit
+                 (null full)
+                 (null prefix)
+                 remaining-input
+                 (not (string-empty-p remaining-input)))
+        (setq commit nil))
+      (and (or commit full prefix)
+           (list :commit commit
+                 :full full
+                 :prefix prefix
+                 :remainder remainder
+                 :remaining-input remaining-input
+                 :regexp-code nil
+                 :regexp nil)))))
 
 (defun liberime-regexp--cache-result (key result)
   "Cache RESULT under KEY when caching is enabled, then return RESULT."
@@ -220,7 +225,7 @@ with the original composition length to detect prefix-only candidates."
     (when (>= (hash-table-count liberime-regexp--candidate-cache)
               liberime-regexp-cache-size)
       (liberime-regexp-clear-cache))
-    (puthash key (copy-tree result) liberime-regexp--candidate-cache))
+    (puthash key result liberime-regexp--candidate-cache))
   result)
 
 (defun liberime-regexp-load-liberime ()
@@ -230,18 +235,12 @@ with the original composition length to detect prefix-only candidates."
   (unless (liberime-workable-p)
     (liberime-load)))
 
-(defun liberime-regexp-get-candidates-list (str)
-  "Return the Rime commit and candidates for code STR.
+(defun liberime-regexp--query-code (str)
+  "Return cached candidate expansion data for Rime code STR.
 
-The return value has the form (COMMIT . CANDIDATES).  COMMIT is nil unless
-Rime automatically committed a prefix.  For example, possible results are:
-
-  (nil 计算 谋算)
-  (计算 与 瓦)
-
-STR must contain only lower-case ASCII letters and apostrophes.  Apostrophes
-are removed before the code is sent to Rime.  Return nil if STR is invalid,
-too long according to `liberime-regexp-max-code-length', or has no matches."
+The result is an internal plist produced by
+`liberime-regexp--default-session-query'.  Return nil if STR is invalid, too
+long according to `liberime-regexp-max-code-length', or has no expansions."
   (let ((code (replace-regexp-in-string "'" "" str t t)))
     (when (and (not (string-empty-p code))
                (let ((case-fold-search nil))
@@ -254,42 +253,84 @@ too long according to `liberime-regexp-max-code-length', or has no matches."
               (and input (not (string-empty-p input))))
              (key (list code
                         (liberime-regexp--candidate-limit)
-                        liberime-regexp-require-full-code-match
                         (liberime-regexp--status-key)))
              (cached (gethash key liberime-regexp--candidate-cache
                               liberime-regexp--unset)))
         (cond
          ((not (eq cached liberime-regexp--unset))
-          (copy-tree cached))
-         ;; A strict query needs the default session.  Leave an existing
-         ;; composition untouched and retry after it ends.
-         ((and active-composition-p
-               liberime-regexp-require-full-code-match)
+          cached)
+         ;; Candidate consumption data needs the default session.  Leave an
+         ;; existing composition untouched and retry after it ends.
+         (active-composition-p
           nil)
          (t
           (liberime-regexp--cache-result
            key
-           (if active-composition-p
-               (liberime-regexp--isolated-query code)
-             (liberime-regexp--default-session-query code)))))))))
+           (liberime-regexp--default-session-query code))))))))
+
+(defun liberime-regexp-get-candidates-list (str)
+  "Return the Rime commit and full-consumption candidates for code STR.
+
+The return value has the form (COMMIT . CANDIDATES).  COMMIT is nil unless
+Rime automatically committed a prefix.  For example, possible results are:
+
+  (nil 计算 谋算)
+  (计算 与 瓦)
+
+STR must contain only lower-case ASCII letters and apostrophes.  Apostrophes
+are removed before the code is sent to Rime.  Candidates which consume only a
+prefix of STR are discarded.  Return nil if STR is invalid, too long according
+to `liberime-regexp-max-code-length', or has no matches."
+  (let* ((query (liberime-regexp--query-code str))
+         (commit (plist-get query :commit))
+         (full (plist-get query :full))
+         (remaining-input (plist-get query :remaining-input)))
+    (when (or full
+              (and commit
+                   (or (null remaining-input)
+                       (string-empty-p remaining-input))))
+      (cons commit full))))
 
 (defun liberime-regexp--code-regexp (code)
   "Return a regexp matching CODE or any of its Rime expansions."
-  (let* ((commit-and-candidates
-          (liberime-regexp-get-candidates-list code))
-         (commit (car commit-and-candidates))
-         (candidates (cdr commit-and-candidates))
-         (converted
-          (cond
-           ((and commit candidates)
-            (mapcar (lambda (candidate)
-                      (concat commit candidate))
-                    candidates))
-           (commit (list commit))
-           (candidates candidates))))
-    (if converted
-        (regexp-opt (delete-dups (cons code converted)))
-      code)))
+  (let* ((query (liberime-regexp--query-code code))
+         (cached (and (equal code (plist-get query :regexp-code))
+                      (plist-get query :regexp))))
+    (or cached
+        (let* ((commit (plist-get query :commit))
+               (full (plist-get query :full))
+               (prefix (plist-get query :prefix))
+               (remainder (plist-get query :remainder))
+               (remaining-input (plist-get query :remaining-input))
+               (converted
+                (cond
+                 ((and commit full)
+                  (mapcar (lambda (candidate)
+                            (concat commit candidate))
+                          full))
+                 (full full)
+                 ((and commit
+                       (or (null remaining-input)
+                           (string-empty-p remaining-input)))
+                  (list commit))))
+               (base (regexp-opt (cons code converted)))
+               (recursive
+                (and prefix
+                     (concat
+                      (regexp-opt
+                       (if commit
+                           (mapcar (lambda (candidate)
+                                     (concat commit candidate))
+                                   prefix)
+                         prefix))
+                      (liberime-regexp--code-regexp remainder))))
+               (regexp (if recursive
+                           (format "\\(?:%s\\|%s\\)" base recursive)
+                         base)))
+          (when query
+            (setf (plist-get query :regexp-code) code
+                  (plist-get query :regexp) regexp))
+          regexp))))
 
 (defun liberime-regexp--tokenize (str)
   "Split STR into tagged Rime-code and literal tokens."

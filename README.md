@@ -2,9 +2,10 @@
 
 Expand lower-case Rime codes in Emacs searches.
 
-The package integrates with isearch, Orderless, and Evil search. With strict
-matching enabled, candidates must consume the complete input code, so a query
-such as `lcdsviyu` does not match the prefix candidate `老` from `劳动之余`.
+The package integrates with isearch, Orderless, and Evil search. Candidates
+must collectively consume the complete input code, so `lcdsviyu` can match an
+unlisted composition such as `唠懂只鱼` but does not match a prefix such as
+`老`. Full-code candidates such as `劳动之余` are also retained.
 
 ## Installation
 
@@ -24,6 +25,5 @@ The package requires [liberime](https://github.com/emacs-rime/liberime)
 
 ## Options
 
-`liberime-regexp-require-full-code-match` defaults to non-nil and filters out
-prefix-only candidates. `liberime-regexp-candidate-limit` bounds candidate
-enumeration, and `liberime-regexp-cache-size` controls the query cache.
+`liberime-regexp-candidate-limit` bounds candidate enumeration, and
+`liberime-regexp-cache-size` controls the query cache.
