@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026
 
-;; Version: 0.2.0
+;; Version: 0.2.1
 ;; Package-Requires: ((emacs "27.1") (liberime "0.0.7"))
 ;; Keywords: convenience, i18n, matching
 
@@ -30,8 +30,9 @@
 
 (require 'isearch)
 (require 'subr-x)
-(require 'liberime)
 
+(declare-function liberime-load "liberime")
+(declare-function liberime-workable-p "liberime")
 (declare-function liberime-clear-composition "ext:liberime-core")
 (declare-function liberime-get-candidates "ext:liberime-core"
                   (&optional limit index))
@@ -224,6 +225,8 @@ with the original composition length to detect prefix-only candidates."
 
 (defun liberime-regexp-load-liberime ()
   "Load and start liberime if necessary."
+  (unless (featurep 'liberime-core)
+    (require 'liberime))
   (unless (liberime-workable-p)
     (liberime-load)))
 
@@ -405,6 +408,11 @@ quote non-code parts of STR; this is used for non-regexp isearch."
         (liberime-regexp--install-integrations))
     (liberime-regexp--remove-integrations)
     (liberime-regexp-clear-cache)))
+
+;;;###autoload
+(defun liberime-regexp-enable ()
+  "Enable `liberime-regexp-mode'."
+  (liberime-regexp-mode 1))
 
 (provide 'liberime-regexp)
 
