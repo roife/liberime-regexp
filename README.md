@@ -1,15 +1,16 @@
 # liberime-regexp
 
-Expand lower-case Rime codes in Emacs searches.
+`liberime-regexp` lets Emacs search with lower-case Rime codes. For example,
+searching for `ni` can match the Rime candidate `你`. It works with built-in
+`isearch`, and integrates with Orderless and Evil search when they are
+available.
 
-The package integrates with isearch, Orderless, and Evil search. Candidates
-must collectively consume the complete input code, so `lcdsviyu` can match an
-unlisted composition such as `唠懂只鱼` but does not match a prefix such as
-`老`. Full-code candidates such as `劳动之余` are also retained.
+Requirements: Emacs 27.1 or newer and [liberime](https://github.com/emacs-rime/liberime)
+0.0.7 or newer.
 
 ## Installation
 
-Using `use-package` and `straight.el`:
+With `straight.el` and `use-package`:
 
 ```elisp
 (use-package liberime-regexp
@@ -20,10 +21,19 @@ Using `use-package` and `straight.el`:
   :hook (liberime-after-start . liberime-regexp-enable))
 ```
 
-The package requires [liberime](https://github.com/emacs-rime/liberime)
-0.0.7 or newer.
-
 ## Options
 
-`liberime-regexp-candidate-limit` bounds candidate enumeration, and
-`liberime-regexp-cache-size` controls the query cache.
+Customize these variables with `M-x customize-group RET liberime-regexp` or
+set them in your Emacs configuration.
+
+| Variable | Default | Description |
+| --- | ---: | --- |
+| `liberime-regexp-max-code-length` | `0` | Maximum code length to expand. `0` means no limit. |
+| `liberime-regexp-candidate-limit` | `100` | Maximum candidates examined for one code. `nil` or a non-positive value means no limit. |
+| `liberime-regexp-cache-size` | `256` | Maximum number of cached queries. A non-positive value disables caching. |
+| `liberime-regexp-omit-code-separators` | `t` | Allow whitespace between adjacent Rime codes to match nothing. |
+
+## Thanks
+
+Thanks to [`rime-regexp.el`](https://github.com/colawithsauce/rime-regexp.el)
+for the inspiration.
