@@ -55,6 +55,47 @@
         (should-not (string-match-p (concat "\\`" regexp "\\'") "甲"))
         (should (eq regexp (liberime-regexp--code-regexp "abcd")))))))
 
+(ert-deftest liberime-regexp-test-avy-char-2-uses-combined-code ()
+  (let (builder-args jump-args)
+    (cl-letf (((symbol-function 'liberime-regexp-build-regexp-string)
+               (lambda (&rest args)
+                 (setq builder-args args)
+                 "expanded"))
+              ((symbol-function 'avy-jump)
+               (lambda (&rest args)
+                 (setq jump-args args))))
+      (liberime-regexp-avy-goto-char-2 ?n ?i 'flip 10 20)
+      (should (equal builder-args '("ni" t)))
+      (should (equal jump-args
+                     '("expanded" :window-flip flip :beg 10 :end 20))))))
+
+(ert-deftest liberime-regexp-test-avy-timer-uses-rime-builder ()
+  (let (builder-args processed)
+    (cl-letf (((symbol-function 'liberime-regexp-build-regexp-string)
+               (lambda (&rest args)
+                 (setq builder-args args)
+                 "expanded"))
+              ((symbol-function 'avy--read-candidates)
+               (lambda (builder)
+                 (should (equal (funcall builder "ni") "expanded"))
+                 'candidates))
+              ((symbol-function 'avy-process)
+               (lambda (candidates)
+                 (setq processed candidates))))
+      (liberime-regexp-avy-goto-char-timer)
+      (should (equal builder-args '("ni" t)))
+      (should (eq processed 'candidates)))))
+
+(ert-deftest liberime-regexp-test-avy-mode-remaps-commands ()
+  (unwind-protect
+      (progn
+        (liberime-regexp-avy-mode 1)
+        (should (eq (command-remapping 'avy-goto-char)
+                    #'liberime-regexp-avy-goto-char))
+        (should (eq (command-remapping 'avy-goto-char-timer)
+                    #'liberime-regexp-avy-goto-char-timer)))
+    (liberime-regexp-avy-mode -1)))
+
 (provide 'liberime-regexp-test)
 
 ;;; liberime-regexp-test.el ends here

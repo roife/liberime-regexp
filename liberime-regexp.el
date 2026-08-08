@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026
 
-;; Version: 0.2.1
-;; Package-Requires: ((emacs "27.1") (liberime "0.0.7"))
+;; Version: 0.3.0
+;; Package-Requires: ((emacs "27.1") (avy "0.5.0") (liberime "0.0.7"))
 ;; Keywords: convenience, i18n, matching
 
 ;; This file is not part of GNU Emacs.
@@ -14,6 +14,7 @@
 ;; example, a search for "ni" can match both the literal code and candidates
 ;; such as "你".  The mode integrates with isearch, `orderless-regexp', and
 ;; Evil's `evil-ex-search-full-pattern' when those functions are available.
+;; `liberime-regexp-avy-mode' adds the same expansion to Avy character jumps.
 ;;
 ;; Candidate lookup normally uses liberime's default session so that an
 ;; automatically committed prefix is retained.  The shortest prefix candidates
@@ -29,6 +30,7 @@
 
 ;;; Code:
 
+(require 'avy)
 (require 'isearch)
 (require 'subr-x)
 
@@ -376,6 +378,74 @@ quote non-code parts of STR; this is used for non-regexp isearch."
          pieces)))
     (mapconcat #'identity (nreverse pieces) "")))
 
+(defun liberime-regexp--avy-input-regexp (input)
+  "Build an Avy regexp from INPUT."
+  (liberime-regexp-build-regexp-string input t))
+
+(defun liberime-regexp-avy-goto-char (char &optional arg)
+  "Jump to CHAR or a Rime candidate for its code.
+
+ARG reverses the value of `avy-all-windows'."
+  (interactive (list (read-char "char: " t)
+                     current-prefix-arg))
+  (avy-with avy-goto-char
+    (avy-jump
+     (liberime-regexp--avy-input-regexp
+      (string (if (= char 13) ?\n char)))
+     :window-flip arg)))
+
+(defun liberime-regexp-avy-goto-char-in-line (char)
+  "Jump within the current line to CHAR or a Rime candidate for its code."
+  (interactive (list (read-char "char: " t)))
+  (avy-with avy-goto-char
+    (avy-jump
+     (liberime-regexp--avy-input-regexp (string char))
+     :beg (line-beginning-position)
+     :end (line-end-position))))
+
+(defun liberime-regexp-avy-goto-char-2
+    (char1 char2 &optional arg beg end)
+  "Jump to CHAR1 CHAR2 or a Rime candidate for their combined code.
+
+ARG reverses `avy-all-windows'.  BEG and END limit the search range."
+  (interactive (list (read-char "char 1: " t)
+                     (read-char "char 2: " t)
+                     current-prefix-arg))
+  (avy-with avy-goto-char-2
+    (avy-jump
+     (liberime-regexp--avy-input-regexp
+      (string (if (= char1 13) ?\n char1)
+              (if (= char2 13) ?\n char2)))
+     :window-flip arg
+     :beg beg
+     :end end)))
+
+(defun liberime-regexp-avy-goto-char-timer (&optional arg)
+  "Read a Rime code and jump to one of its visible candidates.
+
+ARG reverses the value of `avy-all-windows'."
+  (interactive "P")
+  (let ((avy-all-windows (if arg
+                             (not avy-all-windows)
+                           avy-all-windows)))
+    (avy-with avy-goto-char-timer
+      (setq avy--old-cands
+            (avy--read-candidates #'liberime-regexp--avy-input-regexp))
+      (avy-process avy--old-cands))))
+
+(defvar liberime-regexp-avy-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [remap avy-goto-char]
+                #'liberime-regexp-avy-goto-char)
+    (define-key map [remap avy-goto-char-in-line]
+                #'liberime-regexp-avy-goto-char-in-line)
+    (define-key map [remap avy-goto-char-2]
+                #'liberime-regexp-avy-goto-char-2)
+    (define-key map [remap avy-goto-char-timer]
+                #'liberime-regexp-avy-goto-char-timer)
+    map)
+  "Keymap for `liberime-regexp-avy-mode'.")
+
 (defun liberime-regexp-filter-args (args)
   "Replace the first string in ARGS with its Rime-aware regexp."
   (cons (liberime-regexp-build-regexp-string (car args)) (cdr args)))
@@ -449,6 +519,13 @@ quote non-code parts of STR; this is used for non-regexp isearch."
         (liberime-regexp--install-integrations))
     (liberime-regexp--remove-integrations)
     (liberime-regexp-clear-cache)))
+
+;;;###autoload
+(define-minor-mode liberime-regexp-avy-mode
+  "Use Rime codes with Avy character commands."
+  :global t
+  :group 'liberime-regexp
+  :keymap liberime-regexp-avy-mode-map)
 
 ;;;###autoload
 (defun liberime-regexp-enable ()
