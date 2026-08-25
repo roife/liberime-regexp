@@ -71,6 +71,28 @@
                      '("隔离")))
       (should-not default-called))))
 
+(ert-deftest liberime-regexp-test-native-query-stays-in-regexp-module ()
+  (let (native-args liberime-search-called)
+    (cl-letf (((symbol-function 'liberime-regexp--ensure-search-session)
+               (lambda (_status) 42))
+              ((symbol-function 'liberime-regexp--try-load-native-module)
+               (lambda () t))
+              ((symbol-function 'liberime-regexp--native-query)
+               (lambda (&rest args)
+                 (setq native-args args)
+                 '(:commit nil :full ("你") :prefix nil :remainder nil
+                   :remaining-input "ni" :regexp-code nil :regexp nil)))
+              ((symbol-function 'liberime-search)
+               (lambda (&rest _)
+                 (setq liberime-search-called t))))
+      (should
+       (equal (liberime-regexp--isolated-session-query
+               "ni" '((schema_id . "test")))
+              '(:commit nil :full ("你") :prefix nil :remainder nil
+                :remaining-input "ni" :regexp-code nil :regexp nil)))
+      (should-not liberime-search-called)
+      (should (equal native-args '(42 "ni" 100))))))
+
 (ert-deftest liberime-regexp-test-preserves-regexp-composition ()
   (cl-letf (((symbol-function 'liberime-regexp--code-regexp)
              (lambda (code)

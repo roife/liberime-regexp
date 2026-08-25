@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,6 +13,7 @@
 #include <rime/dict/dictionary.h>
 #include <rime/schema.h>
 #include <rime/ticket.h>
+#include <rime_api.h>
 
 #include "emacs-module.h"
 
@@ -23,6 +26,12 @@ using DictionaryCache =
              std::unique_ptr<rime::Dictionary>>;
 
 DictionaryCache dictionaries;
+
+struct Candidate {
+  std::string text;
+  std::string comment;
+  bool has_comment;
+};
 
 std::string get_string(emacs_env *env, emacs_value value) {
   ptrdiff_t size = 0;
@@ -37,6 +46,31 @@ emacs_value vector(emacs_env *env, const std::vector<emacs_value> &values) {
                       const_cast<emacs_value *>(values.data()));
 }
 
+emacs_value list(emacs_env *env, const std::vector<emacs_value> &values) {
+  return env->funcall(env, env->intern(env, "list"), values.size(),
+                      const_cast<emacs_value *>(values.data()));
+}
+
+emacs_value string(emacs_env *env, const std::string &value) {
+  return env->make_string(env, value.data(), value.size());
+}
+
+emacs_value candidate_list(emacs_env *env,
+                           const std::vector<Candidate> &candidates) {
+  std::vector<emacs_value> values;
+  values.reserve(candidates.size());
+  for (const auto &candidate : candidates) {
+    emacs_value value = string(env, candidate.text);
+    if (candidate.has_comment) {
+      emacs_value args[] = {value, env->intern(env, ":comment"),
+                            string(env, candidate.comment)};
+      value = env->funcall(env, env->intern(env, "propertize"), 3, args);
+    }
+    values.push_back(value);
+  }
+  return list(env, values);
+}
+
 emacs_value signal_error(emacs_env *env, const std::string &message) {
   emacs_value text = env->make_string(env, message.data(), message.size());
   emacs_value data[] = {text};
@@ -44,6 +78,120 @@ emacs_value signal_error(emacs_env *env, const std::string &message) {
       env, env->intern(env, "error"),
       env->funcall(env, env->intern(env, "list"), 1, data));
   return env->intern(env, "nil");
+}
+
+emacs_value query(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
+                  void *) noexcept {
+  try {
+    const auto session_id =
+        static_cast<RimeSessionId>(env->extract_integer(env, args[0]));
+    const std::string input = get_string(env, args[1]);
+    const size_t limit =
+        nargs >= 3 && env->is_not_nil(env, args[2])
+            ? std::max<intmax_t>(0, env->extract_integer(env, args[2]))
+            : 0;
+    const RimeApi *api = rime_get_api();
+    if (!api || !RIME_API_AVAILABLE(api, set_input))
+      return env->intern(env, "nil");
+    if (!api->find_session(session_id))
+      return signal_error(env, "Cannot find the Rime session");
+    api->clear_composition(session_id);
+    if (!api->set_input(session_id, input.c_str()))
+      return env->intern(env, "nil");
+
+    std::string commit;
+    bool has_commit = false;
+    RIME_STRUCT(RimeCommit, rime_commit);
+    if (api->get_commit(session_id, &rime_commit)) {
+      if (rime_commit.text) {
+        commit = rime_commit.text;
+        has_commit = true;
+      }
+      api->free_commit(&rime_commit);
+    }
+
+    std::string remaining_input;
+    bool has_remaining_input = false;
+    if (const char *value = api->get_input(session_id)) {
+      remaining_input = value;
+      has_remaining_input = true;
+    }
+
+    size_t input_end = 0;
+    RIME_STRUCT(RimeContext, initial_context);
+    if (api->get_context(session_id, &initial_context)) {
+      input_end = initial_context.composition.length;
+      api->free_context(&initial_context);
+    }
+
+    std::vector<Candidate> full;
+    std::vector<Candidate> prefix;
+    std::string remainder;
+    bool has_remainder = false;
+    std::set<std::pair<int, int>> seen;
+    size_t examined = 0;
+    for (;;) {
+      RIME_STRUCT(RimeContext, context);
+      if (!api->get_context(session_id, &context))
+        break;
+      const int index = context.menu.highlighted_candidate_index;
+      const int page = context.menu.page_no;
+      if (index < 0 || index >= context.menu.num_candidates ||
+          !seen.emplace(page, index).second) {
+        api->free_context(&context);
+        break;
+      }
+
+      const RimeCandidate &candidate = context.menu.candidates[index];
+      Candidate value = {candidate.text ? candidate.text : "",
+                         candidate.comment ? candidate.comment : "",
+                         candidate.comment != nullptr};
+      const size_t selection_end = context.composition.sel_end;
+      const char *preedit = context.composition.preedit;
+      if (selection_end == input_end) {
+        full.push_back(std::move(value));
+      } else if (preedit && selection_end < std::strlen(preedit)) {
+        std::string rest(preedit + selection_end);
+        if (!rest.empty()) {
+          if (!has_remainder || rest.size() > remainder.size()) {
+            remainder = std::move(rest);
+            has_remainder = true;
+            prefix.clear();
+            prefix.push_back(std::move(value));
+          } else if (rest == remainder) {
+            prefix.push_back(std::move(value));
+          }
+        }
+      }
+      api->free_context(&context);
+
+      ++examined;
+      if ((limit > 0 && examined >= limit) ||
+          !api->process_key(session_id, 0xff54, 0))
+        break;
+    }
+
+    const emacs_value nil = env->intern(env, "nil");
+    std::vector<emacs_value> result = {
+        env->intern(env, ":commit"),
+        has_commit ? string(env, commit) : nil,
+        env->intern(env, ":full"),
+        candidate_list(env, full),
+        env->intern(env, ":prefix"),
+        candidate_list(env, prefix),
+        env->intern(env, ":remainder"),
+        has_remainder ? string(env, remainder) : nil,
+        env->intern(env, ":remaining-input"),
+        has_remaining_input ? string(env, remaining_input) : nil,
+        env->intern(env, ":regexp-code"),
+        nil,
+        env->intern(env, ":regexp"),
+        nil,
+    };
+    return list(env, result);
+  } catch (const std::exception &error) {
+    return signal_error(env, error.what());
+  }
 }
 
 std::vector<size_t> utf8_boundaries(const std::string &text) {
@@ -231,6 +379,10 @@ void define(emacs_env *env, const char *name, ptrdiff_t minimum,
 
 extern "C" int emacs_module_init(emacs_runtime *runtime) noexcept {
   emacs_env *env = runtime->get_environment(runtime);
+  define(env, "liberime-regexp--native-query", 2, 3, query,
+         "Query INPUT in SESSION with librime set_input.\n\n"
+         "LIMIT bounds highlighted candidate states; zero means unlimited.\n"
+         "(fn SESSION INPUT &optional LIMIT)");
   define(env, "liberime-regexp--native-segment-han", 6, 6, segment_han,
          "Return static-dictionary word bounds for Han TEXT and CODES.\n\n"
          "(fn SCHEMA-ID NAMESPACE TEXT CODES MAX-WORD-LENGTH "

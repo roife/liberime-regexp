@@ -23,8 +23,9 @@ With `straight.el` and `use-package`:
   :hook (liberime-after-start . liberime-regexp-enable))
 ```
 
-Chinese segmentation additionally needs this package's native module. Build it
-against the same librime version installed on the system:
+The `set_input` search optimization and Chinese segmentation use this
+package's native module. Build it against the same librime version installed
+on the system:
 
 ```sh
 make RIME_PATH=/path/to/librime-source BOOST_INCLUDE=/path/to/boost/include
@@ -32,7 +33,8 @@ make RIME_PATH=/path/to/librime-source BOOST_INCLUDE=/path/to/boost/include
 
 Set `RIME_INTERNAL_CXXFLAGS` when librime's internal dependency headers are in
 non-standard locations. Alternatively, point `liberime-regexp-module-file` at
-an already-built `liberime-regexp-core` module.
+an already-built `liberime-regexp-core` module. Search still works without the
+module by falling back to Liberime's ordinary candidate-search binding.
 
 ## Avy
 
@@ -51,7 +53,8 @@ typing `ni` can jump to `你` or another visible Rime candidate.
 Search expansion reuses an isolated Rime session, avoiding repeated session
 creation and leaving the user's active composition untouched. If that session
 cannot reproduce the active schema option state, the package falls back to its
-original default-session query.
+original default-session query. The optional native module binds librime's
+public `set_input` API directly; no Liberime source changes are required.
 
 ### Evaluation
 
@@ -59,7 +62,7 @@ With `luna_pinyin` and a 100-candidate limit:
 
 | Implementation | Regexp construction | Generated regexp |
 | --- | ---: | ---: |
-| Reused session + librime `set_input` | 1.8–5.5× faster | byte-for-byte identical |
+| Native query + librime `set_input` | 2.2–3.0× faster on tested 20+ letter codes | byte-for-byte identical |
 
 The optimization retains user dictionaries, automatic commits, schema output
 filters, and the existing prefix/remainder recursion. Equivalence runs covered

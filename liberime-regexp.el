@@ -24,9 +24,9 @@
 ;; Candidate lookup normally reuses an isolated Rime session.  It falls back to
 ;; the default session when the active option state cannot be reproduced.  The
 ;; shortest prefix candidates may be composed recursively, but every generated
-;; expansion must consume the complete supplied code.  A static Dictionary
-;; backend is also available when user-dictionary and output-filter semantics
-;; are not required.
+;; expansion must consume the complete supplied code.  When its native module
+;; is available, this package calls librime's public set_input API directly;
+;; Liberime itself needs no package-specific changes.
 ;;
 ;; Basic setup:
 ;;
@@ -55,6 +55,8 @@
 (declare-function liberime-session-create "ext:liberime-core"
                   (&optional schema-id))
 (declare-function liberime-session-destroy "ext:liberime-core" (session))
+(declare-function liberime-regexp--native-query
+                  "ext:liberime-regexp-core" (session input &optional limit))
 (declare-function liberime-regexp--native-segment-han
                   "ext:liberime-regexp-core"
                   (schema-id namespace text codes max-word-length single-weight))
@@ -282,6 +284,30 @@ preedit for a prefix candidate."
           :prefix (liberime-regexp--normalize-candidates (nreverse prefix))
           :remainder remainder)))
 
+(defun liberime-regexp--make-query-result
+    (commit expansions remaining-input)
+  "Build a query result from COMMIT, EXPANSIONS, and REMAINING-INPUT."
+  (let ((full (plist-get expansions :full))
+        (prefix (plist-get expansions :prefix))
+        (remainder (plist-get expansions :remainder)))
+    ;; A commit followed by unusable residual input can itself be only an
+    ;; automatically committed prefix, so do not expose it as a complete
+    ;; expansion.
+    (when (and commit
+               (null full)
+               (null prefix)
+               remaining-input
+               (not (string-empty-p remaining-input)))
+      (setq commit nil))
+    (and (or commit full prefix)
+         (list :commit commit
+               :full full
+               :prefix prefix
+               :remainder remainder
+               :remaining-input remaining-input
+               :regexp-code nil
+               :regexp nil))))
+
 (defun liberime-regexp--default-session-query (code)
   "Return a candidate expansion plist for CODE using the default session."
   (let (commit expansions remaining-input)
@@ -298,26 +324,8 @@ preedit for a prefix candidate."
                      (liberime-regexp--candidate-expansions))
                 commit (liberime-get-commit)))
       (liberime-clear-composition))
-    (let ((full (plist-get expansions :full))
-          (prefix (plist-get expansions :prefix))
-          (remainder (plist-get expansions :remainder)))
-      ;; A commit followed by unusable residual input can itself be only an
-      ;; automatically committed prefix, so do not expose it as a complete
-      ;; expansion.
-      (when (and commit
-                 (null full)
-                 (null prefix)
-                 remaining-input
-                 (not (string-empty-p remaining-input)))
-        (setq commit nil))
-      (and (or commit full prefix)
-           (list :commit commit
-                 :full full
-                 :prefix prefix
-                 :remainder remainder
-                 :remaining-input remaining-input
-                 :regexp-code nil
-                 :regexp nil)))))
+    (liberime-regexp--make-query-result
+     commit expansions remaining-input)))
 
 (defun liberime-regexp--cache-result (key result)
   "Cache RESULT under KEY when caching is enabled, then return RESULT."
@@ -380,14 +388,28 @@ preedit for a prefix candidate."
   "Query CODE in an isolated session matching default-session STATUS."
   (when-let* ((session (liberime-regexp--ensure-search-session status)))
     (condition-case nil
-        (liberime-search code (liberime-regexp--candidate-limit)
-                         nil nil t session)
+        (let ((result
+               (or (and (liberime-regexp--try-load-native-module)
+                        (fboundp 'liberime-regexp--native-query)
+                        (liberime-regexp--native-query
+                         session code
+                         (or (liberime-regexp--candidate-limit) 0)))
+                   ;; The native module is optional.  Liberime's ordinary
+                   ;; public search binding remains the compatibility path.
+                   (liberime-search code (liberime-regexp--candidate-limit)
+                                    nil nil t session))))
+          ;; Keep the cached regexp in the same plist object even when the
+          ;; Liberime compatibility result did not reserve these slots.
+          (when result
+            (setq result (plist-put result :regexp-code nil)
+                  result (plist-put result :regexp nil)))
+          result)
       (error
        (liberime-regexp-close-search-session)
        nil))))
 
-(defun liberime-regexp-load-native-module ()
-  "Load the native static-dictionary word-graph module."
+(defun liberime-regexp--try-load-native-module ()
+  "Try to load this package's native module and return non-nil on success."
   (unless (featurep 'liberime-regexp-core)
     (when (and liberime-regexp-module-file
                (file-exists-p liberime-regexp-module-file))
@@ -396,7 +418,11 @@ preedit for a prefix candidate."
                                              liberime-regexp--directory)
                            load-path)))
       (require 'liberime-regexp-core nil t)))
-  (unless (featurep 'liberime-regexp-core)
+  (featurep 'liberime-regexp-core))
+
+(defun liberime-regexp-load-native-module ()
+  "Load the native candidate-query and static-dictionary module."
+  (unless (liberime-regexp--try-load-native-module)
     (user-error "Build liberime-regexp-core with make first")))
 
 (defun liberime-regexp--query-code (str &optional preserve-separators)
