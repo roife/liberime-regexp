@@ -76,17 +76,25 @@ byte-for-byte identical.
 EMT/ewt-rs:
 
 ```elisp
-(liberime-regexp-segment "我愛北京天安門")
-;; => ((0 . 2) (2 . 4) (4 . 7))
+(liberime-regexp-segment "研究生命起源")
+;; => ((0 . 2) (2 . 4) (4 . 6))
 
-(liberime-regexp-split-string "我愛北京天安門")
-;; => ("我愛" "北京" "天安門")
+(liberime-regexp-split-string "研究生命起源")
+;; => ("研究" "生命" "起源")
 ```
 
 The exact result depends on the active Rime schema and its dictionaries. The
 segmenter constructs one weighted word graph for each Han run and selects its
 maximum-weight path. This excludes sentences synthesized by Rime from smaller
 words. Single Han characters are used as a fallback.
+
+Canonical spellings are read from librime's reverse dictionary and matched
+directly against its binary tables. Keyboard spelling is bypassed, so full
+Pinyin and double-Pinyin schemas backed by the same dictionary produce the same
+word boundaries; shape-based schemas naturally use their own dictionary.
+Output filters such as OpenCC are not run during this raw-table lookup, so a
+filtered character variant must itself exist in the dictionary or it falls
+back to single characters.
 
 Enable Rime-aware word commands separately from search expansion:
 
@@ -97,13 +105,6 @@ Enable Rime-aware word commands separately from search expansion:
 This remaps `forward-word`, `backward-word`, `kill-word`,
 `backward-kill-word`, and `mark-word`. Ordinary non-Chinese words continue to
 use Emacs's built-in word motion.
-
-By default, Emacs's built-in simplified and traditional Chinese Pinyin tables
-are used to generate full-Pinyin Rime codes. The active schema must accept
-full Pinyin, and its output variant should match the text being segmented. For
-double-Pinyin or shape-based schemas, set
-`liberime-regexp-segment-code-function` to a function which receives a Chinese
-substring and returns its possible Rime codes.
 
 ## Options
 
@@ -117,8 +118,7 @@ set them in your Emacs configuration.
 | `liberime-regexp-cache-size` | `256` | Maximum number of cached queries. A non-positive value disables caching. |
 | `liberime-regexp-omit-code-separators` | `t` | Allow whitespace between adjacent Rime codes to match nothing. |
 | `liberime-regexp-segment-max-word-length` | `6` | Maximum Chinese word length considered during segmentation. |
-| `liberime-regexp-segment-code-limit` | `64` | Maximum Pinyin combinations tried for a substring. |
-| `liberime-regexp-segment-code-function` | `liberime-regexp-segment-pinyin-codes` | Convert a Chinese substring to codes accepted by the active Rime schema. |
+| `liberime-regexp-segment-code-limit` | `64` | Maximum reverse-dictionary code combinations tried for a substring. |
 | `liberime-regexp-segment-dictionary-namespace` | `translator` | Schema namespace used to create the librime Dictionary. |
 | `liberime-regexp-segment-context-length` | `32` | Maximum Han context examined on each side of point for word operations. |
 | `liberime-regexp-segment-single-character-weight` | `-12.0` | Fallback graph weight assigned to individual Han characters. |

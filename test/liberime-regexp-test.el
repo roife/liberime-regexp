@@ -195,13 +195,6 @@
                     #'liberime-regexp-avy-goto-char-timer)))
     (liberime-regexp-avy-mode -1)))
 
-(ert-deftest liberime-regexp-test-pinyin-code-provider ()
-  (let ((liberime-regexp--pinyin-character-cache nil))
-    (should (member "ni'hao"
-                    (liberime-regexp-segment-pinyin-codes "你好")))
-    (should (member "yu'yan'chu'li"
-                    (liberime-regexp-segment-pinyin-codes "語言處理")))))
-
 (ert-deftest liberime-regexp-test-segments-mixed-text ()
   (cl-letf (((symbol-function 'liberime-regexp--segment-han-with-dictionary)
              (lambda (_text) '((0 . 2) (2 . 4) (4 . 7)))))
@@ -225,18 +218,21 @@
       (should (= (point) 2)))))
 
 (ert-deftest liberime-regexp-test-native-segmentation-boundaries ()
-  (let ((liberime-regexp-segment-code-function
-         (lambda (_word) '("yan'jiu'sheng'ming'qi'yuan")))
-        (liberime-regexp--segment-cache (make-hash-table :test #'equal)))
+  (let ((liberime-regexp-segment-code-limit 7)
+        (liberime-regexp--segment-cache (make-hash-table :test #'equal))
+        native-args)
     (cl-letf (((symbol-function 'liberime-regexp-load-liberime) #'ignore)
               ((symbol-function 'liberime-regexp-load-native-module) #'ignore)
               ((symbol-function 'liberime-get-status)
                (lambda () '((schema_id . "test"))))
               ((symbol-function 'liberime-regexp--native-segment-han)
-               (lambda (&rest _)
+               (lambda (&rest args)
+                 (setq native-args args)
                  [[0 2] [2 4] [4 6]])))
       (should (equal (liberime-regexp-split-string "研究生命起源")
-                     '("研究" "生命" "起源"))))))
+                     '("研究" "生命" "起源")))
+      (should (equal native-args
+                     '("test" "translator" "研究生命起源" 6 7 -12.0))))))
 
 (ert-deftest liberime-regexp-test-segment-mode-remaps-word-commands ()
   (cl-letf (((symbol-function 'liberime-regexp-load-liberime) #'ignore))

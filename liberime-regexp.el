@@ -16,10 +16,10 @@
 ;; Evil's `evil-ex-search-full-pattern' when those functions are available.
 ;; `liberime-regexp-avy-mode' adds the same expansion to Avy character jumps.
 ;; `liberime-regexp-segment-mode' builds a weighted word graph from librime's
-;; static Dictionary and SyllableGraph bindings for Chinese word motion,
-;; killing, and marking.  Full Pinyin is generated from Emacs's built-in
-;; simplified and traditional Pinyin tables; other schemas can provide a custom
-;; code conversion function.
+;; Dictionary and ReverseLookupDictionary for Chinese word motion, killing,
+;; and marking.  It reads canonical spellings from the active Rime dictionary,
+;; so keyboard layouts such as full Pinyin, double Pinyin, and Cangjie need no
+;; package-specific conversion.
 ;;
 ;; Candidate lookup normally reuses an isolated Rime session.  It falls back to
 ;; the default session when the active option state cannot be reproduced.  The
@@ -59,15 +59,10 @@
                   "ext:liberime-regexp-core" (session input &optional limit))
 (declare-function liberime-regexp--native-segment-han
                   "ext:liberime-regexp-core"
-                  (schema-id namespace text codes max-word-length single-weight))
+                  (schema-id namespace text max-word-length
+                             code-limit single-weight))
 (declare-function liberime-regexp--native-clear-cache
                   "ext:liberime-regexp-core" ())
-(declare-function quail-build-decode-map "quail"
-                  (map-list key decode-map num &optional maxnum ignores))
-(declare-function quail-map "quail" ())
-(declare-function quail-select-package "quail" (name))
-(defvar pinyin-character-map)
-(defvar quail-current-package)
 
 (defgroup liberime-regexp nil
   "Build regular expressions from Rime candidates."
@@ -123,23 +118,11 @@ segmentation more expensive because more substrings have to be looked up."
   :group 'liberime-regexp)
 
 (defcustom liberime-regexp-segment-code-limit 64
-  "Maximum number of pronunciations tried for one Chinese substring.
+  "Maximum reverse-dictionary code combinations tried for one substring.
 
-The default code provider combines all pronunciations from Emacs's built-in
-Pinyin table.  This limit prevents words containing several polyphonic
-characters from producing an excessive number of Rime queries.  A non-positive
-value means no limit."
+This bounds combinations for polyphonic and shape-code dictionary entries.  A
+non-positive value means no limit."
   :type 'integer
-  :group 'liberime-regexp)
-
-(defcustom liberime-regexp-segment-code-function
-  #'liberime-regexp-segment-pinyin-codes
-  "Function used to turn a Chinese word into Rime codes.
-
-The function receives one string and returns a list of lower-case Rime codes.
-The default works with schemas which accept full Pinyin.  Users of double
-Pinyin or shape-based schemas can set this to a scheme-specific converter."
-  :type 'function
   :group 'liberime-regexp)
 
 (defcustom liberime-regexp-segment-dictionary-namespace "translator"
@@ -172,9 +155,6 @@ Pinyin or shape-based schemas can set this to a scheme-specific converter."
 
 (defvar liberime-regexp--candidate-cache (make-hash-table :test #'equal)
   "Cache candidate queries and their generated regexps.")
-
-(defvar liberime-regexp--pinyin-character-cache nil
-  "Map Chinese characters to the pronunciations in `pinyin-character-map'.")
 
 (defvar liberime-regexp--segment-cache (make-hash-table :test #'equal)
   "Cache complete segmentation results.")
@@ -489,93 +469,12 @@ to `liberime-regexp-max-code-length', or has no matches."
                        (string-empty-p remaining-input))))
       (cons commit full))))
 
-(defun liberime-regexp--pinyin-character-cache ()
-  "Return a character-to-Pinyin table, creating it when necessary."
-  (or liberime-regexp--pinyin-character-cache
-      (progn
-        (require 'pinyin)
-        (let ((table (make-hash-table :test #'eql)))
-          (dolist (entry pinyin-character-map)
-            (let ((code (car entry)))
-              (mapc (lambda (character)
-                      (cl-pushnew code (gethash character table)
-                                  :test #'string=))
-                    (cdr entry))))
-          ;; `pinyin-character-map' primarily covers simplified Chinese.
-          ;; Emacs ships a tone-marked Big5 Quail table as well; fold it in so
-          ;; the segmenter follows traditional-output Rime schemas too.
-          (when (locate-library "quail/PY-b5")
-            (require 'quail)
-            (let ((saved-package quail-current-package))
-              (unwind-protect
-                  (progn
-                    (load "quail/PY-b5" nil t)
-                    (quail-select-package "chinese-py-b5")
-                    (let ((decode-map (list 'decode-map)))
-                      (quail-build-decode-map
-                       (list (quail-map)) "" decode-map 0)
-                      (dolist (entry (cdr decode-map))
-                        (let* ((code-with-tone (car entry))
-                               (code (replace-regexp-in-string
-                                      "u:" "v"
-                                      (replace-regexp-in-string
-                                       "[1-5]\\'" "" code-with-tone)))
-                               (translations (cdr entry)))
-                          (mapc
-                           (lambda (translation)
-                             (let ((character
-                                    (cond
-                                     ((integerp translation) translation)
-                                     ((and (stringp translation)
-                                           (= (length translation) 1))
-                                      (aref translation 0)))))
-                               (when character
-                                 (cl-pushnew code
-                                             (gethash character table)
-                                             :test #'string=))))
-                           (if (vectorp translations)
-                               (append translations nil)
-                             (list translations)))))))
-                (setq quail-current-package saved-package))))
-          (setq liberime-regexp--pinyin-character-cache table)))))
-
-(defun liberime-regexp-segment-pinyin-codes (word)
-  "Return possible full-Pinyin Rime codes for Chinese WORD.
-
-Pronunciations come from Emacs's built-in `pinyin-character-map'.  The number
-of returned combinations is bounded by
-`liberime-regexp-segment-code-limit'.  Syllables are separated with
-apostrophes so that Rime can distinguish xi'an from xian."
-  (let ((table (liberime-regexp--pinyin-character-cache))
-        (codes '(""))
-        failed)
-    (mapc
-     (lambda (character)
-       (let ((pronunciations (gethash character table))
-             combined)
-         (if (null pronunciations)
-             (setq failed t codes nil)
-           (catch 'limit
-             (dolist (prefix codes)
-               (dolist (pronunciation pronunciations)
-                 (push (concat prefix
-                               (unless (string-empty-p prefix) "'")
-                               pronunciation)
-                       combined)
-                 (when (and (> liberime-regexp-segment-code-limit 0)
-                            (>= (length combined)
-                                liberime-regexp-segment-code-limit))
-                   (throw 'limit nil)))))
-           (setq codes (nreverse combined)))))
-     (string-to-list word))
-    (unless failed codes)))
-
 (defun liberime-regexp--han-character-p (character)
   "Return non-nil when CHARACTER uses the Han script."
   (and character (eq (aref char-script-table character) 'han)))
 
 (defun liberime-regexp--segment-han-with-dictionary (string)
-  "Segment Han STRING using librime's static Dictionary entries."
+  "Segment Han STRING using librime's reverse dictionary and binary tables."
   (liberime-regexp-load-native-module)
   (mapcar (lambda (bounds)
             (cons (aref bounds 0) (aref bounds 1)))
@@ -583,9 +482,8 @@ apostrophes so that Rime can distinguish xi'an from xian."
            (liberime-regexp--native-segment-han
             (alist-get 'schema_id (liberime-get-status))
             liberime-regexp-segment-dictionary-namespace string
-            (vconcat
-             (funcall liberime-regexp-segment-code-function string))
             (max 1 liberime-regexp-segment-max-word-length)
+            (max 0 liberime-regexp-segment-code-limit)
             (float liberime-regexp-segment-single-character-weight))
            nil)))
 
@@ -634,14 +532,13 @@ apostrophes so that Rime can distinguish xi'an from xian."
   "Segment STRING and return a list of word bounds.
 
 Each bound is a cons cell (BEGINNING . END), using zero-based character
-positions as in `substring'.  The dictionary backend constructs a weighted
-word graph from raw librime Dictionary entries and selects its maximum-weight
-path.  Non-Chinese words use the usual Emacs character syntax."
+positions as in `substring'.  The reverse-dictionary backend constructs a
+weighted word graph from raw librime table entries and selects its
+maximum-weight path.  Non-Chinese words use the usual Emacs character syntax."
   (liberime-regexp-load-liberime)
   (let* ((key (list string
                     liberime-regexp-segment-max-word-length
                     liberime-regexp-segment-code-limit
-                    liberime-regexp-segment-code-function
                     liberime-regexp-segment-single-character-weight
                     liberime-regexp-segment-dictionary-namespace
                     (alist-get 'schema_id (liberime-get-status))))

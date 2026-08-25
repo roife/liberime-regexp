@@ -1,16 +1,20 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <rime/algo/syllabifier.h>
 #include <rime/dict/dictionary.h>
+#include <rime/dict/reverse_lookup_dictionary.h>
 #include <rime/schema.h>
 #include <rime/ticket.h>
 #include <rime_api.h>
@@ -21,9 +25,14 @@ int plugin_is_GPL_compatible;
 
 namespace {
 
-using DictionaryCache =
-    std::map<std::pair<std::string, std::string>,
-             std::unique_ptr<rime::Dictionary>>;
+struct DictionaryBundle {
+  std::unique_ptr<rime::Dictionary> dictionary;
+  std::unique_ptr<rime::ReverseLookupDictionary> reverse;
+  std::vector<std::unordered_map<std::string, rime::SyllableId>> syllable_ids;
+};
+
+using DictionaryCache = std::map<std::pair<std::string, std::string>,
+                                 std::unique_ptr<DictionaryBundle>>;
 
 DictionaryCache dictionaries;
 
@@ -204,89 +213,141 @@ std::vector<size_t> utf8_boundaries(const std::string &text) {
   return result;
 }
 
-std::vector<std::string> split_code(const std::string &code) {
+std::vector<std::string> split_reverse_codes(const std::string &codes) {
+  std::istringstream stream(codes);
   std::vector<std::string> result;
-  size_t beginning = 0;
-  while (beginning <= code.size()) {
-    size_t end = code.find('\'', beginning);
-    if (end == std::string::npos)
-      end = code.size();
-    if (end > beginning)
-      result.push_back(code.substr(beginning, end - beginning));
-    if (end == code.size())
-      break;
-    beginning = end + 1;
-  }
+  for (std::string code; stream >> code;)
+    result.push_back(std::move(code));
   return result;
 }
 
-rime::Dictionary *get_dictionary(const std::string &schema_id,
+DictionaryBundle *get_dictionary(const std::string &schema_id,
                                  const std::string &name_space) {
   auto key = std::make_pair(schema_id, name_space);
   auto found = dictionaries.find(key);
   if (found != dictionaries.end())
     return found->second.get();
 
-  auto *component = dynamic_cast<rime::DictionaryComponent *>(
+  auto *dictionary_component = dynamic_cast<rime::DictionaryComponent *>(
       rime::Dictionary::Require("dictionary"));
-  if (!component)
+  auto *reverse_component = rime::ReverseLookupDictionary::Require(
+      "reverse_lookup_dictionary");
+  if (!dictionary_component || !reverse_component)
     return nullptr;
   rime::Schema schema(schema_id);
   rime::Ticket ticket(&schema, name_space);
-  std::unique_ptr<rime::Dictionary> dictionary(component->Create(ticket));
-  if (!dictionary || !dictionary->Load())
+  auto bundle = std::make_unique<DictionaryBundle>();
+  bundle->dictionary.reset(dictionary_component->Create(ticket));
+  bundle->reverse.reset(reverse_component->Create(ticket));
+  if (!bundle->dictionary || !bundle->dictionary->Load() ||
+      !bundle->reverse || !bundle->reverse->Load())
     return nullptr;
-  auto *result = dictionary.get();
-  dictionaries.emplace(std::move(key), std::move(dictionary));
+
+  for (const auto &table : bundle->dictionary->tables()) {
+    rime::Syllabary syllabary;
+    if (!table->GetSyllabary(&syllabary))
+      return nullptr;
+    std::unordered_map<std::string, rime::SyllableId> ids;
+    rime::SyllableId id = 0;
+    for (const auto &syllable : syllabary)
+      ids.emplace(syllable, id++);
+    bundle->syllable_ids.push_back(std::move(ids));
+  }
+
+  auto *result = bundle.get();
+  dictionaries.emplace(std::move(key), std::move(bundle));
   return result;
 }
 
-void add_edges(rime::Dictionary *dictionary, const std::string &text,
-               const std::vector<size_t> &text_offsets,
-               const std::string &code, size_t max_word_length,
-               std::map<std::pair<size_t, size_t>, double> *edges) {
-  const auto syllables = split_code(code);
-  const size_t character_count = text_offsets.size() - 1;
-  if (syllables.size() != character_count)
-    return;
-  std::string input;
-  std::vector<size_t> code_offsets = {0};
-  for (const auto &syllable : syllables) {
-    input += syllable;
-    code_offsets.push_back(input.size());
+std::vector<std::string> reverse_lookup(DictionaryBundle *bundle,
+                                        const std::string &text) {
+  std::string codes;
+  if (!bundle->reverse->ReverseLookup(text, &codes))
+    return {};
+  return split_reverse_codes(codes);
+}
+
+double lookup_weight(DictionaryBundle *bundle, const std::string &expected,
+                     const std::vector<std::string> &syllables) {
+  double result = -std::numeric_limits<double>::infinity();
+  const auto &tables = bundle->dictionary->tables();
+  for (size_t table_index = 0; table_index < tables.size(); ++table_index) {
+    rime::Code code;
+    for (const auto &syllable : syllables) {
+      auto found = bundle->syllable_ids[table_index].find(syllable);
+      if (found == bundle->syllable_ids[table_index].end()) {
+        code.clear();
+        break;
+      }
+      code.push_back(found->second);
+    }
+    if (code.empty())
+      continue;
+
+    const auto &table = tables[table_index];
+    auto accessor = code.size() == 1 ? table->QueryWords(code[0])
+                                     : table->QueryPhrases(code);
+    while (!accessor.exhausted()) {
+      const auto *entry = accessor.entry();
+      if (entry && table->GetEntryText(*entry) == expected)
+        result = std::max(result, static_cast<double>(entry->weight));
+      accessor.Next();
+    }
   }
-  rime::SyllableGraph graph;
-  rime::Syllabifier syllabifier(" '", false, true);
-  if (syllabifier.BuildSyllableGraph(input, *dictionary->prism(), &graph) <= 0)
-    return;
+  return result;
+}
+
+void add_edges(DictionaryBundle *bundle, const std::string &text,
+               const std::vector<size_t> &text_offsets,
+               size_t max_word_length, size_t code_limit,
+               std::map<std::pair<size_t, size_t>, double> *edges) {
+  const size_t character_count = text_offsets.size() - 1;
+  std::vector<std::vector<std::string>> character_codes(character_count);
+  for (size_t index = 0; index < character_count; ++index) {
+    character_codes[index] = reverse_lookup(
+        bundle, text.substr(text_offsets[index],
+                            text_offsets[index + 1] - text_offsets[index]));
+  }
 
   for (size_t beginning = 0; beginning < character_count; ++beginning) {
-    auto collector = dictionary->Lookup(graph, code_offsets[beginning]);
-    if (!collector)
-      continue;
-    for (auto &[code_end, iterator] : *collector) {
-      auto found = std::lower_bound(code_offsets.begin(), code_offsets.end(),
-                                    code_end);
-      if (found == code_offsets.end() || *found != code_end)
-        continue;
-      size_t end = found - code_offsets.begin();
-      if (end <= beginning + 1 || end - beginning > max_word_length)
-        continue;
-      std::string expected =
+    const size_t maximum =
+        std::min(character_count, beginning + max_word_length);
+    for (size_t end = beginning + 2; end <= maximum; ++end) {
+      const std::string expected =
           text.substr(text_offsets[beginning],
                       text_offsets[end] - text_offsets[beginning]);
-      while (!iterator.exhausted()) {
-        auto entry = iterator.Peek();
-        if (entry && entry->text == expected) {
-          auto key = std::make_pair(beginning, end);
-          auto old = edges->find(key);
-          if (old == edges->end() || entry->weight > old->second)
-            (*edges)[key] = entry->weight;
+      std::set<std::vector<std::string>> sequences;
+
+      // Shape-code dictionaries may encode a complete phrase as one spelling.
+      for (const auto &code : reverse_lookup(bundle, expected)) {
+        if (code_limit > 0 && sequences.size() >= code_limit)
           break;
-        }
-        if (!iterator.Next())
-          break;
+        sequences.insert({code});
       }
+
+      std::vector<std::string> sequence;
+      std::function<void(size_t)> combine = [&](size_t index) {
+        if (code_limit > 0 && sequences.size() >= code_limit)
+          return;
+        if (index == end) {
+          sequences.insert(sequence);
+          return;
+        }
+        for (const auto &code : character_codes[index]) {
+          sequence.push_back(code);
+          combine(index + 1);
+          sequence.pop_back();
+          if (code_limit > 0 && sequences.size() >= code_limit)
+            return;
+        }
+      };
+      combine(beginning);
+
+      double weight = -std::numeric_limits<double>::infinity();
+      for (const auto &codes : sequences)
+        weight = std::max(weight, lookup_weight(bundle, expected, codes));
+      if (std::isfinite(weight))
+        (*edges)[{beginning, end}] = weight;
     }
   }
 }
@@ -298,22 +359,20 @@ emacs_value segment_han(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
     const std::string name_space = get_string(env, args[1]);
     const std::string text = get_string(env, args[2]);
     const size_t max_word_length =
-        std::max<intmax_t>(1, env->extract_integer(env, args[4]));
+        std::max<intmax_t>(1, env->extract_integer(env, args[3]));
+    const size_t code_limit =
+        std::max<intmax_t>(0, env->extract_integer(env, args[4]));
     const double single_weight = env->extract_float(env, args[5]);
     const auto text_offsets = utf8_boundaries(text);
     const size_t character_count = text_offsets.size() - 1;
 
-    rime::Dictionary *dictionary = get_dictionary(schema_id, name_space);
+    DictionaryBundle *dictionary = get_dictionary(schema_id, name_space);
     if (!dictionary)
       return signal_error(env, "Could not load the Rime dictionary");
 
     std::map<std::pair<size_t, size_t>, double> edges;
-    ptrdiff_t code_count = env->vec_size(env, args[3]);
-    for (ptrdiff_t index = 0; index < code_count; ++index) {
-      add_edges(dictionary, text, text_offsets,
-                get_string(env, env->vec_get(env, args[3], index)),
-                max_word_length, &edges);
-    }
+    add_edges(dictionary, text, text_offsets, max_word_length, code_limit,
+              &edges);
     for (size_t index = 0; index < character_count; ++index)
       edges[{index, index + 1}] = single_weight;
 
@@ -384,8 +443,8 @@ extern "C" int emacs_module_init(emacs_runtime *runtime) noexcept {
          "LIMIT bounds highlighted candidate states; zero means unlimited.\n"
          "(fn SESSION INPUT &optional LIMIT)");
   define(env, "liberime-regexp--native-segment-han", 6, 6, segment_han,
-         "Return static-dictionary word bounds for Han TEXT and CODES.\n\n"
-         "(fn SCHEMA-ID NAMESPACE TEXT CODES MAX-WORD-LENGTH "
+         "Return reverse-dictionary word bounds for Han TEXT.\n\n"
+         "(fn SCHEMA-ID NAMESPACE TEXT MAX-WORD-LENGTH CODE-LIMIT "
          "SINGLE-WEIGHT)");
   define(env, "liberime-regexp--native-clear-cache", 0, 0, clear_cache,
          "Release cached native Dictionary objects.\n\n(fn)");
