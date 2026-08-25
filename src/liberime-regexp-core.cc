@@ -13,9 +13,12 @@
 #include <utility>
 #include <vector>
 
+#include <rime/candidate.h>
+#include <rime/context.h>
 #include <rime/dict/dictionary.h>
 #include <rime/dict/reverse_lookup_dictionary.h>
 #include <rime/schema.h>
+#include <rime/service.h>
 #include <rime/ticket.h>
 #include <rime_api.h>
 
@@ -89,6 +92,15 @@ emacs_value signal_error(emacs_env *env, const std::string &message) {
   return env->intern(env, "nil");
 }
 
+bool selected_candidate_is_completion(RimeSessionId session_id) {
+  auto session = rime::Service::instance().GetSession(session_id);
+  if (!session || !session->context())
+    return false;
+  auto candidate = session->context()->GetSelectedCandidate();
+  auto genuine = rime::Candidate::GetGenuineCandidate(candidate);
+  return genuine && genuine->type() == "completion";
+}
+
 emacs_value query(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
                   void *) noexcept {
   try {
@@ -155,11 +167,15 @@ emacs_value query(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
       Candidate value = {candidate.text ? candidate.text : "",
                          candidate.comment ? candidate.comment : "",
                          candidate.comment != nullptr};
+      const bool completion = selected_candidate_is_completion(session_id);
       const size_t selection_end = context.composition.sel_end;
       const char *preedit = context.composition.preedit;
-      if (selection_end == input_end) {
+      // Search expansion is exact: predictive translator candidates must not
+      // turn a prefix such as "exp" into "explain".
+      if (!completion && selection_end == input_end) {
         full.push_back(std::move(value));
-      } else if (preedit && selection_end < std::strlen(preedit)) {
+      } else if (!completion && preedit &&
+                 selection_end < std::strlen(preedit)) {
         std::string rest(preedit + selection_end);
         if (!rest.empty()) {
           if (!has_remainder || rest.size() > remainder.size()) {
@@ -439,7 +455,9 @@ void define(emacs_env *env, const char *name, ptrdiff_t minimum,
 extern "C" int emacs_module_init(emacs_runtime *runtime) noexcept {
   emacs_env *env = runtime->get_environment(runtime);
   define(env, "liberime-regexp--native-query", 2, 3, query,
-         "Query INPUT in SESSION with librime set_input.\n\n"
+         "Query INPUT in SESSION without predictive completions.\n\n"
+         "The query uses librime set_input and excludes genuine candidates "
+         "whose Rime type is completion.\n"
          "LIMIT bounds highlighted candidate states; zero means unlimited.\n"
          "(fn SESSION INPUT &optional LIMIT)");
   define(env, "liberime-regexp--native-segment-han", 6, 6, segment_han,

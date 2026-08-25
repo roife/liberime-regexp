@@ -56,6 +56,11 @@ cannot reproduce the active schema option state, the package falls back to its
 original default-session query. The optional native module binds librime's
 public `set_input` API directly; no Liberime source changes are required.
 
+Predictive candidates whose genuine Rime type is `completion` are excluded.
+The literal input remains in the regexp, so `exp` still matches `exp` but is
+not expanded to English completions such as `explain`. Exact Chinese candidates
+and shortest-prefix recursion are retained.
+
 ### Evaluation
 
 With `luna_pinyin` and a 100-candidate limit:
@@ -66,9 +71,9 @@ With `luna_pinyin` and a 100-candidate limit:
 
 The optimization retains user dictionaries, automatic commits, schema output
 filters, and the existing prefix/remainder recursion. Equivalence runs covered
-519 Pinyin codes, 126 Cangjie codes, and 40 Stroke codes without a single
-candidate-structure difference. Representative final regexps were also
-byte-for-byte identical.
+519 Pinyin codes, 126 Cangjie codes, and 40 Stroke codes; non-completion
+candidates retained their ordering and consumption structure. Completion
+candidates are the only intentionally removed branches.
 
 ## Chinese word segmentation
 
