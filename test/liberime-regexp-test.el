@@ -55,6 +55,83 @@
         (should-not (string-match-p (concat "\\`" regexp "\\'") "甲"))
         (should (eq regexp (liberime-regexp--code-regexp "abcd")))))))
 
+(ert-deftest liberime-regexp-test-query-prefers-isolated-session ()
+  (let ((liberime-regexp--candidate-cache (make-hash-table :test #'equal))
+        default-called)
+    (cl-letf (((symbol-function 'liberime-regexp-load-liberime) #'ignore)
+              ((symbol-function 'liberime-get-status)
+               (lambda (&optional _) '((schema_id . "test"))))
+              ((symbol-function 'liberime-get-input) (lambda () nil))
+              ((symbol-function 'liberime-regexp--isolated-session-query)
+               (lambda (_code _status)
+                 '(:full ("隔离") :prefix nil :remaining-input "geli")))
+              ((symbol-function 'liberime-regexp--default-session-query)
+               (lambda (_code) (setq default-called t))))
+      (should (equal (plist-get (liberime-regexp--query-code "geli") :full)
+                     '("隔离")))
+      (should-not default-called))))
+
+(ert-deftest liberime-regexp-test-preserves-regexp-composition ()
+  (cl-letf (((symbol-function 'liberime-regexp--code-regexp)
+             (lambda (code)
+               (pcase code
+                 ("ni" "\\(?:ni\\|你\\)")
+                 ("hao" "\\(?:hao\\|好\\)")
+                 (_ (regexp-quote code))))))
+    (let ((regexp
+           (liberime-regexp-build-regexp-string "^ni.*hao$")))
+      (should (string-match-p regexp "你很好"))
+      (should-not (string-match-p regexp "甲你很好乙")))
+    ;; Ordinary isearch quotes regexp punctuation while still expanding codes.
+    (let ((literal
+           (liberime-regexp-build-regexp-string "ni.*" t)))
+      (should (string-match-p (concat "\\`" literal "\\'") "你.*"))
+      (should-not (string-match-p (concat "\\`" literal "\\'")
+                                  "你abc")))))
+
+(ert-deftest liberime-regexp-test-filter-args-preserves-call-shape ()
+  (cl-letf (((symbol-function 'liberime-regexp-build-regexp-string)
+             (lambda (regexp &optional _) (concat "expanded:" regexp))))
+    (should (equal (liberime-regexp-filter-args
+                    '("^ni$" secondary :option value))
+                   '("expanded:^ni$" secondary :option value)))))
+
+(ert-deftest liberime-regexp-test-orderless-and-evil-advices-compose ()
+  (dolist (function '(orderless-regexp evil-ex-search-full-pattern))
+    (let ((old-definition (and (fboundp function)
+                               (symbol-function function))))
+      (unwind-protect
+          (progn
+            (fset function (lambda (&rest args) args))
+            (cl-letf (((symbol-function
+                        'liberime-regexp-build-regexp-string)
+                       (lambda (regexp &optional _)
+                         (concat "expanded:" regexp))))
+              (liberime-regexp--update-advices t)
+              (should (equal (funcall function "^ni$" 'keep)
+                             '("expanded:^ni$" keep)))
+              (liberime-regexp--update-advices nil)))
+        (when (advice-member-p #'liberime-regexp-filter-args function)
+          (advice-remove function #'liberime-regexp-filter-args))
+        (if old-definition
+            (fset function old-definition)
+          (fmakunbound function))))))
+
+(ert-deftest liberime-regexp-test-isearch-search-function-composes ()
+  (cl-letf (((symbol-function 'liberime-regexp--code-regexp)
+             (lambda (code)
+               (if (string= code "ni") "\\(?:ni\\|你\\)" code))))
+    (with-temp-buffer
+      (insert "甲你乙")
+      (goto-char (point-min))
+      (let ((isearch-forward t)
+            (isearch-regexp t)
+            (isearch-regexp-function nil)
+            (liberime-regexp--saved-isearch-search-fun-function nil))
+        (should (funcall (liberime-regexp--isearch-search-function)
+                         "ni" nil t 1))
+        (should (= (point) 3))))))
+
 (ert-deftest liberime-regexp-test-avy-char-2-uses-combined-code ()
   (let (builder-args jump-args)
     (cl-letf (((symbol-function 'liberime-regexp-build-regexp-string)
@@ -95,6 +172,60 @@
         (should (eq (command-remapping 'avy-goto-char-timer)
                     #'liberime-regexp-avy-goto-char-timer)))
     (liberime-regexp-avy-mode -1)))
+
+(ert-deftest liberime-regexp-test-pinyin-code-provider ()
+  (let ((liberime-regexp--pinyin-character-cache nil))
+    (should (member "ni'hao"
+                    (liberime-regexp-segment-pinyin-codes "你好")))
+    (should (member "yu'yan'chu'li"
+                    (liberime-regexp-segment-pinyin-codes "語言處理")))))
+
+(ert-deftest liberime-regexp-test-segments-mixed-text ()
+  (cl-letf (((symbol-function 'liberime-regexp--segment-han-with-dictionary)
+             (lambda (_text) '((0 . 2) (2 . 4) (4 . 7)))))
+    (should (equal (liberime-regexp--segment-with-dictionary
+                    "我爱北京天安门, Emacs42")
+                   '((0 . 2) (2 . 4) (4 . 7) (9 . 16))))))
+
+(ert-deftest liberime-regexp-test-word-motion-uses-rime-boundaries ()
+  (cl-letf (((symbol-function 'liberime-regexp-segment)
+             (lambda (_text) '((0 . 2) (2 . 4) (4 . 7)))))
+    (with-temp-buffer
+      (insert "，我爱北京天安门！hello")
+      (goto-char (point-min))
+      (should (liberime-regexp-forward-word 1))
+      (should (= (point) 4))
+      (should (liberime-regexp-forward-word 2))
+      (should (= (point) 9))
+      (should (liberime-regexp-backward-word 1))
+      (should (= (point) 6))
+      (should (liberime-regexp-backward-word 2))
+      (should (= (point) 2)))))
+
+(ert-deftest liberime-regexp-test-native-segmentation-boundaries ()
+  (let ((liberime-regexp-segment-code-function
+         (lambda (_word) '("yan'jiu'sheng'ming'qi'yuan")))
+        (liberime-regexp--segment-cache (make-hash-table :test #'equal)))
+    (cl-letf (((symbol-function 'liberime-regexp-load-liberime) #'ignore)
+              ((symbol-function 'liberime-regexp-load-native-module) #'ignore)
+              ((symbol-function 'liberime-get-status)
+               (lambda () '((schema_id . "test"))))
+              ((symbol-function 'liberime-regexp--native-segment-han)
+               (lambda (&rest _)
+                 [[0 2] [2 4] [4 6]])))
+      (should (equal (liberime-regexp-split-string "研究生命起源")
+                     '("研究" "生命" "起源"))))))
+
+(ert-deftest liberime-regexp-test-segment-mode-remaps-word-commands ()
+  (cl-letf (((symbol-function 'liberime-regexp-load-liberime) #'ignore))
+    (unwind-protect
+        (progn
+          (liberime-regexp-segment-mode 1)
+          (should (eq (command-remapping 'forward-word)
+                      #'liberime-regexp-forward-word))
+          (should (eq (command-remapping 'backward-kill-word)
+                      #'liberime-regexp-backward-kill-word)))
+      (liberime-regexp-segment-mode -1))))
 
 (provide 'liberime-regexp-test)
 

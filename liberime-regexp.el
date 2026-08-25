@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026
 
-;; Version: 0.3.0
+;; Version: 0.5.0
 ;; Package-Requires: ((emacs "27.1") (avy "0.5.0") (liberime "0.0.7"))
 ;; Keywords: convenience, i18n, matching
 
@@ -15,22 +15,29 @@
 ;; such as "你".  The mode integrates with isearch, `orderless-regexp', and
 ;; Evil's `evil-ex-search-full-pattern' when those functions are available.
 ;; `liberime-regexp-avy-mode' adds the same expansion to Avy character jumps.
+;; `liberime-regexp-segment-mode' builds a weighted word graph from librime's
+;; static Dictionary and SyllableGraph bindings for Chinese word motion,
+;; killing, and marking.  Full Pinyin is generated from Emacs's built-in
+;; simplified and traditional Pinyin tables; other schemas can provide a custom
+;; code conversion function.
 ;;
-;; Candidate lookup normally uses liberime's default session so that an
-;; automatically committed prefix is retained.  The shortest prefix candidates
-;; may be composed recursively, but every generated expansion must consume the
-;; complete supplied code.  If the default session already has an active
-;; composition, cached results remain available; an uncached code is left
-;; unexpanded so that the composition is untouched.
+;; Candidate lookup normally reuses an isolated Rime session.  It falls back to
+;; the default session when the active option state cannot be reproduced.  The
+;; shortest prefix candidates may be composed recursively, but every generated
+;; expansion must consume the complete supplied code.  A static Dictionary
+;; backend is also available when user-dictionary and output-filter semantics
+;; are not required.
 ;;
 ;; Basic setup:
 ;;
 ;;   (require 'liberime-regexp)
 ;;   (liberime-regexp-mode 1)
+;;   (liberime-regexp-segment-mode 1)
 
 ;;; Code:
 
 (require 'avy)
+(require 'cl-lib)
 (require 'isearch)
 (require 'subr-x)
 
@@ -40,14 +47,34 @@
 (declare-function liberime-get-commit "ext:liberime-core")
 (declare-function liberime-get-context "ext:liberime-core")
 (declare-function liberime-get-input "ext:liberime-core")
-(declare-function liberime-get-status "ext:liberime-core")
+(declare-function liberime-get-status "ext:liberime-core" (&optional session))
 (declare-function liberime-process-key "ext:liberime-core"
                   (keycode &optional mask))
+(declare-function liberime-search "ext:liberime-core"
+                  (string &optional limit index schema-id full-context session))
+(declare-function liberime-session-create "ext:liberime-core"
+                  (&optional schema-id))
+(declare-function liberime-session-destroy "ext:liberime-core" (session))
+(declare-function liberime-regexp--native-segment-han
+                  "ext:liberime-regexp-core"
+                  (schema-id namespace text codes max-word-length single-weight))
+(declare-function liberime-regexp--native-clear-cache
+                  "ext:liberime-regexp-core" ())
+(declare-function quail-build-decode-map "quail"
+                  (map-list key decode-map num &optional maxnum ignores))
+(declare-function quail-map "quail" ())
+(declare-function quail-select-package "quail" (name))
+(defvar pinyin-character-map)
+(defvar quail-current-package)
 
 (defgroup liberime-regexp nil
   "Build regular expressions from Rime candidates."
   :group 'matching
   :prefix "liberime-regexp-")
+
+(defconst liberime-regexp--directory
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory containing the liberime-regexp package.")
 
 (defcustom liberime-regexp-max-code-length 0
   "Maximum Rime code length to expand.
@@ -85,6 +112,54 @@ which contains the original separator can still match."
   :type 'boolean
   :group 'liberime-regexp)
 
+(defcustom liberime-regexp-segment-max-word-length 6
+  "Maximum Chinese word length considered by the segmenter.
+
+The segmenter tries longer Rime dictionary entries first.  Larger values make
+segmentation more expensive because more substrings have to be looked up."
+  :type 'integer
+  :group 'liberime-regexp)
+
+(defcustom liberime-regexp-segment-code-limit 64
+  "Maximum number of pronunciations tried for one Chinese substring.
+
+The default code provider combines all pronunciations from Emacs's built-in
+Pinyin table.  This limit prevents words containing several polyphonic
+characters from producing an excessive number of Rime queries.  A non-positive
+value means no limit."
+  :type 'integer
+  :group 'liberime-regexp)
+
+(defcustom liberime-regexp-segment-code-function
+  #'liberime-regexp-segment-pinyin-codes
+  "Function used to turn a Chinese word into Rime codes.
+
+The function receives one string and returns a list of lower-case Rime codes.
+The default works with schemas which accept full Pinyin.  Users of double
+Pinyin or shape-based schemas can set this to a scheme-specific converter."
+  :type 'function
+  :group 'liberime-regexp)
+
+(defcustom liberime-regexp-segment-dictionary-namespace "translator"
+  "Schema namespace from which the librime Dictionary is created."
+  :type 'string
+  :group 'liberime-regexp)
+
+(defcustom liberime-regexp-segment-context-length 32
+  "Maximum Han context examined on each side of point for word motion."
+  :type 'integer
+  :group 'liberime-regexp)
+
+(defcustom liberime-regexp-segment-single-character-weight -12.0
+  "Fallback graph weight assigned to each single Han character."
+  :type 'number
+  :group 'liberime-regexp)
+
+(defcustom liberime-regexp-module-file nil
+  "Optional path to the liberime-regexp native module."
+  :type '(choice (const nil) file)
+  :group 'liberime-regexp)
+
 (defconst liberime-regexp--code-pattern "[a-z][a-z']*"
   "Regexp matching a Rime code embedded in a search string.")
 
@@ -96,6 +171,21 @@ which contains the original separator can still match."
 (defvar liberime-regexp--candidate-cache (make-hash-table :test #'equal)
   "Cache candidate queries and their generated regexps.")
 
+(defvar liberime-regexp--pinyin-character-cache nil
+  "Map Chinese characters to the pronunciations in `pinyin-character-map'.")
+
+(defvar liberime-regexp--segment-cache (make-hash-table :test #'equal)
+  "Cache complete segmentation results.")
+
+(defvar liberime-regexp--search-session nil
+  "Isolated librime session reused for search expansion.")
+
+(defvar liberime-regexp--search-session-key nil
+  "Rime status key associated with `liberime-regexp--search-session'.")
+
+(defvar liberime-regexp--search-session-unavailable-key nil
+  "Status key for which an equivalent isolated session could not be made.")
+
 (defvar liberime-regexp--saved-isearch-search-fun-function nil)
 
 (defun liberime-regexp--candidate-limit ()
@@ -104,9 +194,9 @@ which contains the original separator can still match."
        (> liberime-regexp-candidate-limit 0)
        liberime-regexp-candidate-limit))
 
-(defun liberime-regexp--status-key ()
+(defun liberime-regexp--status-key (&optional status)
   "Return the Rime state relevant to candidate lookup."
-  (let ((status (liberime-get-status)))
+  (let ((status (or status (liberime-get-status))))
     (list (alist-get 'schema_id status)
           (alist-get 'is_ascii_mode status)
           (alist-get 'is_full_shape status)
@@ -116,7 +206,15 @@ which contains the original separator can still match."
 (defun liberime-regexp-clear-cache ()
   "Clear cached Rime candidate queries."
   (interactive)
-  (clrhash liberime-regexp--candidate-cache))
+  (clrhash liberime-regexp--candidate-cache)
+  (clrhash liberime-regexp--segment-cache))
+
+(defun liberime-regexp-clear-dictionary-cache ()
+  "Release native Dictionary objects and cached segmentation results."
+  (interactive)
+  (when (fboundp 'liberime-regexp--native-clear-cache)
+    (liberime-regexp--native-clear-cache))
+  (clrhash liberime-regexp--segment-cache))
 
 (defun liberime-regexp--normalize-candidates (candidates)
   "Return CANDIDATES without empty strings or duplicates."
@@ -237,30 +335,102 @@ preedit for a prefix candidate."
   (unless (liberime-workable-p)
     (liberime-load)))
 
-(defun liberime-regexp--query-code (str)
+(defun liberime-regexp-close-search-session ()
+  "Destroy the isolated Rime session used by search expansion."
+  (when liberime-regexp--search-session
+    (ignore-errors
+      (liberime-session-destroy liberime-regexp--search-session)))
+  (setq liberime-regexp--search-session nil
+        liberime-regexp--search-session-key nil
+        liberime-regexp--search-session-unavailable-key nil))
+
+(defun liberime-regexp--ensure-search-session (status)
+  "Return an isolated session equivalent to default-session STATUS."
+  (let ((key (liberime-regexp--status-key status)))
+    (cond
+     ((and liberime-regexp--search-session
+           (equal key liberime-regexp--search-session-key))
+      liberime-regexp--search-session)
+     ((equal key liberime-regexp--search-session-unavailable-key)
+      nil)
+     ((not (and (fboundp 'liberime-session-create)
+                (fboundp 'liberime-session-destroy)))
+      nil)
+     (t
+      (liberime-regexp-close-search-session)
+      (condition-case nil
+          (let* ((session
+                  (liberime-session-create (alist-get 'schema_id status)))
+                 (session-key
+                  (liberime-regexp--status-key
+                   (liberime-get-status session))))
+            (if (equal key session-key)
+                (progn
+                  (setq liberime-regexp--search-session session
+                        liberime-regexp--search-session-key key)
+                  session)
+              (liberime-session-destroy session)
+              (setq liberime-regexp--search-session-unavailable-key key)
+              nil))
+        (error
+         (setq liberime-regexp--search-session-unavailable-key key)
+         nil))))))
+
+(defun liberime-regexp--isolated-session-query (code status)
+  "Query CODE in an isolated session matching default-session STATUS."
+  (when-let* ((session (liberime-regexp--ensure-search-session status)))
+    (condition-case nil
+        (liberime-search code (liberime-regexp--candidate-limit)
+                         nil nil t session)
+      (error
+       (liberime-regexp-close-search-session)
+       nil))))
+
+(defun liberime-regexp-load-native-module ()
+  "Load the native static-dictionary word-graph module."
+  (unless (featurep 'liberime-regexp-core)
+    (when (and liberime-regexp-module-file
+               (file-exists-p liberime-regexp-module-file))
+      (load-file liberime-regexp-module-file))
+    (let ((load-path (cons (expand-file-name "src"
+                                             liberime-regexp--directory)
+                           load-path)))
+      (require 'liberime-regexp-core nil t)))
+  (unless (featurep 'liberime-regexp-core)
+    (user-error "Build liberime-regexp-core with make first")))
+
+(defun liberime-regexp--query-code (str &optional preserve-separators)
   "Return cached candidate expansion data for Rime code STR.
 
 The result is an internal plist produced by
 `liberime-regexp--default-session-query'.  Return nil if STR is invalid, too
-long according to `liberime-regexp-max-code-length', or has no expansions."
-  (let ((code (replace-regexp-in-string "'" "" str t t)))
+long according to `liberime-regexp-max-code-length', or has no expansions.
+When PRESERVE-SEPARATORS is non-nil, send apostrophes to Rime instead of
+removing them."
+  (let ((code (if preserve-separators
+                  str
+                (replace-regexp-in-string "'" "" str t t))))
     (when (and (not (string-empty-p code))
                (let ((case-fold-search nil))
                  (string-match-p "\\`[a-z']+\\'" str))
                (or (<= liberime-regexp-max-code-length 0)
                    (<= (length code) liberime-regexp-max-code-length)))
       (liberime-regexp-load-liberime)
-      (let* ((input (liberime-get-input))
+      (let* ((status (liberime-get-status))
+             (input (liberime-get-input))
              (active-composition-p
               (and input (not (string-empty-p input))))
              (key (list code
                         (liberime-regexp--candidate-limit)
-                        (liberime-regexp--status-key)))
+                        (liberime-regexp--status-key status)))
              (cached (gethash key liberime-regexp--candidate-cache
                               liberime-regexp--unset)))
         (cond
          ((not (eq cached liberime-regexp--unset))
           cached)
+         ((let ((result
+                 (liberime-regexp--isolated-session-query code status)))
+            (and result (liberime-regexp--cache-result key result))))
          ;; Candidate consumption data needs the default session.  Leave an
          ;; existing composition untouched and retry after it ends.
          (active-composition-p
@@ -292,6 +462,298 @@ to `liberime-regexp-max-code-length', or has no matches."
                    (or (null remaining-input)
                        (string-empty-p remaining-input))))
       (cons commit full))))
+
+(defun liberime-regexp--pinyin-character-cache ()
+  "Return a character-to-Pinyin table, creating it when necessary."
+  (or liberime-regexp--pinyin-character-cache
+      (progn
+        (require 'pinyin)
+        (let ((table (make-hash-table :test #'eql)))
+          (dolist (entry pinyin-character-map)
+            (let ((code (car entry)))
+              (mapc (lambda (character)
+                      (cl-pushnew code (gethash character table)
+                                  :test #'string=))
+                    (cdr entry))))
+          ;; `pinyin-character-map' primarily covers simplified Chinese.
+          ;; Emacs ships a tone-marked Big5 Quail table as well; fold it in so
+          ;; the segmenter follows traditional-output Rime schemas too.
+          (when (locate-library "quail/PY-b5")
+            (require 'quail)
+            (let ((saved-package quail-current-package))
+              (unwind-protect
+                  (progn
+                    (load "quail/PY-b5" nil t)
+                    (quail-select-package "chinese-py-b5")
+                    (let ((decode-map (list 'decode-map)))
+                      (quail-build-decode-map
+                       (list (quail-map)) "" decode-map 0)
+                      (dolist (entry (cdr decode-map))
+                        (let* ((code-with-tone (car entry))
+                               (code (replace-regexp-in-string
+                                      "u:" "v"
+                                      (replace-regexp-in-string
+                                       "[1-5]\\'" "" code-with-tone)))
+                               (translations (cdr entry)))
+                          (mapc
+                           (lambda (translation)
+                             (let ((character
+                                    (cond
+                                     ((integerp translation) translation)
+                                     ((and (stringp translation)
+                                           (= (length translation) 1))
+                                      (aref translation 0)))))
+                               (when character
+                                 (cl-pushnew code
+                                             (gethash character table)
+                                             :test #'string=))))
+                           (if (vectorp translations)
+                               (append translations nil)
+                             (list translations)))))))
+                (setq quail-current-package saved-package))))
+          (setq liberime-regexp--pinyin-character-cache table)))))
+
+(defun liberime-regexp-segment-pinyin-codes (word)
+  "Return possible full-Pinyin Rime codes for Chinese WORD.
+
+Pronunciations come from Emacs's built-in `pinyin-character-map'.  The number
+of returned combinations is bounded by
+`liberime-regexp-segment-code-limit'.  Syllables are separated with
+apostrophes so that Rime can distinguish xi'an from xian."
+  (let ((table (liberime-regexp--pinyin-character-cache))
+        (codes '(""))
+        failed)
+    (mapc
+     (lambda (character)
+       (let ((pronunciations (gethash character table))
+             combined)
+         (if (null pronunciations)
+             (setq failed t codes nil)
+           (catch 'limit
+             (dolist (prefix codes)
+               (dolist (pronunciation pronunciations)
+                 (push (concat prefix
+                               (unless (string-empty-p prefix) "'")
+                               pronunciation)
+                       combined)
+                 (when (and (> liberime-regexp-segment-code-limit 0)
+                            (>= (length combined)
+                                liberime-regexp-segment-code-limit))
+                   (throw 'limit nil)))))
+           (setq codes (nreverse combined)))))
+     (string-to-list word))
+    (unless failed codes)))
+
+(defun liberime-regexp--han-character-p (character)
+  "Return non-nil when CHARACTER uses the Han script."
+  (and character (eq (aref char-script-table character) 'han)))
+
+(defun liberime-regexp--segment-han-with-dictionary (string)
+  "Segment Han STRING using librime's static Dictionary entries."
+  (liberime-regexp-load-native-module)
+  (mapcar (lambda (bounds)
+            (cons (aref bounds 0) (aref bounds 1)))
+          (append
+           (liberime-regexp--native-segment-han
+            (alist-get 'schema_id (liberime-get-status))
+            liberime-regexp-segment-dictionary-namespace string
+            (vconcat
+             (funcall liberime-regexp-segment-code-function string))
+            (max 1 liberime-regexp-segment-max-word-length)
+            (float liberime-regexp-segment-single-character-weight))
+           nil)))
+
+(defun liberime-regexp--segment-with-dictionary (string)
+  "Segment STRING using the librime Dictionary backend."
+  (let ((position 0)
+        (length (length string))
+        bounds)
+    (while (< position length)
+      (let ((character (aref string position)))
+        (cond
+         ((liberime-regexp--han-character-p character)
+          (let ((beginning position))
+            (while (and (< position length)
+                        (liberime-regexp--han-character-p
+                         (aref string position)))
+              (setq position (1+ position)))
+            (dolist (bound
+                     (liberime-regexp--segment-han-with-dictionary
+                      (substring string beginning position)))
+              (push (cons (+ beginning (car bound))
+                          (+ beginning (cdr bound)))
+                    bounds))))
+         ((memq (char-syntax character) '(?w ?_))
+          (let ((beginning position))
+            (while (and (< position length)
+                        (not (liberime-regexp--han-character-p
+                              (aref string position)))
+                        (memq (char-syntax (aref string position)) '(?w ?_)))
+              (setq position (1+ position)))
+            (push (cons beginning position) bounds)))
+         (t
+          (setq position (1+ position))))))
+    (nreverse bounds)))
+
+(defun liberime-regexp--cache-segmentation (key result)
+  "Cache segmentation RESULT under KEY, then return RESULT."
+  (when (> liberime-regexp-cache-size 0)
+    (when (>= (hash-table-count liberime-regexp--segment-cache)
+              liberime-regexp-cache-size)
+      (clrhash liberime-regexp--segment-cache))
+    (puthash key result liberime-regexp--segment-cache))
+  result)
+
+(defun liberime-regexp-segment (string)
+  "Segment STRING and return a list of word bounds.
+
+Each bound is a cons cell (BEGINNING . END), using zero-based character
+positions as in `substring'.  The dictionary backend constructs a weighted
+word graph from raw librime Dictionary entries and selects its maximum-weight
+path.  Non-Chinese words use the usual Emacs character syntax."
+  (liberime-regexp-load-liberime)
+  (let* ((key (list string
+                    liberime-regexp-segment-max-word-length
+                    liberime-regexp-segment-code-limit
+                    liberime-regexp-segment-code-function
+                    liberime-regexp-segment-single-character-weight
+                    liberime-regexp-segment-dictionary-namespace
+                    (alist-get 'schema_id (liberime-get-status))))
+         (cached (gethash key liberime-regexp--segment-cache
+                          liberime-regexp--unset)))
+    (if (not (eq cached liberime-regexp--unset))
+        cached
+      (liberime-regexp--cache-segmentation
+       key (liberime-regexp--segment-with-dictionary string)))))
+
+(defun liberime-regexp-split-string (string)
+  "Split STRING into words using the active Rime dictionary.
+
+Whitespace and punctuation are not included in the result.  Use
+`liberime-regexp-segment' when the original positions are needed."
+  (mapcar (lambda (bounds)
+            (substring string (car bounds) (cdr bounds)))
+          (liberime-regexp-segment string)))
+
+(defun liberime-regexp--han-window-at-point (backward)
+  "Return bounded Han context around point, or nil.
+
+When BACKWARD is non-nil, associate a word boundary with the character before
+point; otherwise associate it with the character after point."
+  (let* ((anchor (if backward (1- (point)) (point)))
+         (limit (max 1 liberime-regexp-segment-context-length)))
+    (when (and (>= anchor (point-min))
+               (< anchor (point-max))
+               (liberime-regexp--han-character-p (char-after anchor)))
+      (let ((beginning anchor)
+            (end (1+ anchor))
+            (minimum (max (point-min) (- anchor (1- limit))))
+            (maximum (min (point-max) (+ anchor limit))))
+        (while (and (> beginning minimum)
+                    (liberime-regexp--han-character-p
+                     (char-after (1- beginning))))
+          (setq beginning (1- beginning)))
+        (while (and (< end maximum)
+                    (liberime-regexp--han-character-p (char-after end)))
+          (setq end (1+ end)))
+        (list beginning end anchor)))))
+
+(defun liberime-regexp-words-at-point (&optional backward)
+  "Return the selected Chinese word at point.
+
+Each result has the form (WORD LEFT RIGHT), where LEFT and RIGHT are distances
+from point to the word's beginning and end.  At a word boundary, use the word
+after point by default; when BACKWARD is non-nil, use the word before point."
+  (when-let* ((window (liberime-regexp--han-window-at-point backward))
+              (window-beginning (nth 0 window))
+              (window-end (nth 1 window))
+              (anchor (nth 2 window)))
+    (let* ((text (buffer-substring-no-properties window-beginning window-end))
+           (anchor-offset (- anchor window-beginning))
+           (point-offset (- (point) window-beginning))
+           (bounds (cl-find-if
+                    (lambda (bound)
+                      (and (<= (car bound) anchor-offset)
+                           (< anchor-offset (cdr bound))))
+                    (liberime-regexp-segment text))))
+      (when bounds
+        (list (list (substring text (car bounds) (cdr bounds))
+                    (- point-offset (car bounds))
+                    (- (cdr bounds) point-offset)))))))
+
+(defun liberime-regexp--longest-distance (words index)
+  "Return the greatest non-negative distance at INDEX in WORDS."
+  (let ((distance 0))
+    (dolist (word words distance)
+      (setq distance (max distance (max 0 (nth index word)))))))
+
+(defun liberime-regexp-forward-word (&optional arg)
+  "Move forward ARG Chinese or ordinary words.
+
+Chinese word boundaries are obtained from the active Rime dictionary.  Move
+backward when ARG is negative."
+  (interactive "^p")
+  (setq arg (or arg 1))
+  (if (< arg 0)
+      (liberime-regexp-backward-word (- arg))
+    (let ((count 0)
+          stopped)
+      (while (and (< count arg) (< (point) (point-max)) (not stopped))
+        (unless (memq (char-syntax (or (char-after) 0)) '(?w ?_))
+          (skip-syntax-forward "^w_"))
+        (if (>= (point) (point-max))
+            (setq stopped t)
+          (if (liberime-regexp--han-character-p (char-after))
+              (forward-char
+               (max 1 (liberime-regexp--longest-distance
+                       (liberime-regexp-words-at-point) 2)))
+            (forward-word 1))
+          (setq count (1+ count))))
+      (= count arg))))
+
+(defun liberime-regexp-backward-word (&optional arg)
+  "Move backward ARG Chinese or ordinary words.
+
+Chinese word boundaries are obtained from the active Rime dictionary.  Move
+forward when ARG is negative."
+  (interactive "^p")
+  (setq arg (or arg 1))
+  (if (< arg 0)
+      (liberime-regexp-forward-word (- arg))
+    (let ((count 0)
+          stopped)
+      (while (and (< count arg) (> (point) (point-min)) (not stopped))
+        (unless (memq (char-syntax (or (char-before) 0)) '(?w ?_))
+          (skip-syntax-backward "^w_"))
+        (if (<= (point) (point-min))
+            (setq stopped t)
+          (if (liberime-regexp--han-character-p (char-before))
+              (backward-char
+               (max 1 (liberime-regexp--longest-distance
+                       (liberime-regexp-words-at-point t) 1)))
+            (backward-word 1))
+          (setq count (1+ count))))
+      (= count arg))))
+
+(defun liberime-regexp-kill-word (arg)
+  "Kill ARG words forward, using Rime for Chinese word boundaries."
+  (interactive "p")
+  (kill-region (point)
+               (save-excursion
+                 (liberime-regexp-forward-word arg)
+                 (point))))
+
+(defun liberime-regexp-backward-kill-word (arg)
+  "Kill ARG words backward, using Rime for Chinese word boundaries."
+  (interactive "p")
+  (liberime-regexp-kill-word (- arg)))
+
+(defun liberime-regexp-mark-word (&optional arg)
+  "Mark ARG words, using Rime for Chinese word boundaries."
+  (interactive "p")
+  (setq arg (or arg 1))
+  (push-mark (point) t t)
+  (liberime-regexp-forward-word arg))
 
 (defun liberime-regexp--code-regexp (code)
   "Return a regexp matching CODE or any of its Rime expansions."
@@ -446,6 +908,21 @@ ARG reverses the value of `avy-all-windows'."
     map)
   "Keymap for `liberime-regexp-avy-mode'.")
 
+(defvar liberime-regexp-segment-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [remap forward-word]
+                #'liberime-regexp-forward-word)
+    (define-key map [remap backward-word]
+                #'liberime-regexp-backward-word)
+    (define-key map [remap kill-word]
+                #'liberime-regexp-kill-word)
+    (define-key map [remap backward-kill-word]
+                #'liberime-regexp-backward-kill-word)
+    (define-key map [remap mark-word]
+                #'liberime-regexp-mark-word)
+    map)
+  "Keymap for `liberime-regexp-segment-mode'.")
+
 (defun liberime-regexp-filter-args (args)
   "Replace the first string in ARGS with its Rime-aware regexp."
   (cons (liberime-regexp-build-regexp-string (car args)) (cdr args)))
@@ -516,8 +993,12 @@ ARG reverses the value of `avy-all-windows'."
       (progn
         (liberime-regexp-load-liberime)
         (liberime-regexp-clear-cache)
+        (ignore-errors
+          (liberime-regexp--ensure-search-session
+           (liberime-get-status)))
         (liberime-regexp--install-integrations))
     (liberime-regexp--remove-integrations)
+    (liberime-regexp-close-search-session)
     (liberime-regexp-clear-cache)))
 
 ;;;###autoload
@@ -526,6 +1007,15 @@ ARG reverses the value of `avy-all-windows'."
   :global t
   :group 'liberime-regexp
   :keymap liberime-regexp-avy-mode-map)
+
+;;;###autoload
+(define-minor-mode liberime-regexp-segment-mode
+  "Use the active Rime dictionary for Chinese word operations."
+  :global t
+  :group 'liberime-regexp
+  :keymap liberime-regexp-segment-mode-map
+  (when liberime-regexp-segment-mode
+    (liberime-regexp-load-liberime)))
 
 ;;;###autoload
 (defun liberime-regexp-enable ()

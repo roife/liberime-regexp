@@ -3,10 +3,12 @@
 `liberime-regexp` lets Emacs search and jump with lower-case Rime codes. For
 example, searching for `ni` can match the Rime candidate `你`. It works with
 built-in `isearch` and Avy, and integrates with Orderless and Evil search when
-they are available.
+they are available. It can also use the active Rime dictionary to segment
+Chinese text and make word motion, killing, and marking respect those
+boundaries.
 
 Requirements: Emacs 27.1 or newer, [Avy](https://github.com/abo-abo/avy) 0.5.0
-or newer, and [liberime](https://github.com/emacs-rime/liberime) 0.0.7 or newer.
+or newer, and [Liberime](https://github.com/emacs-rime/liberime) 0.0.7 or newer.
 
 ## Installation
 
@@ -21,6 +23,17 @@ With `straight.el` and `use-package`:
   :hook (liberime-after-start . liberime-regexp-enable))
 ```
 
+Chinese segmentation additionally needs this package's native module. Build it
+against the same librime version installed on the system:
+
+```sh
+make RIME_PATH=/path/to/librime-source BOOST_INCLUDE=/path/to/boost/include
+```
+
+Set `RIME_INTERNAL_CXXFLAGS` when librime's internal dependency headers are in
+non-standard locations. Alternatively, point `liberime-regexp-module-file` at
+an already-built `liberime-regexp-core` module.
+
 ## Avy
 
 Enable Rime expansion for Avy's character commands:
@@ -33,6 +46,62 @@ This remaps `avy-goto-char`, `avy-goto-char-in-line`, `avy-goto-char-2`, and
 `avy-goto-char-timer`. The timer command accepts a complete Rime code, so
 typing `ni` can jump to `你` or another visible Rime candidate.
 
+## Search optimization
+
+Search expansion reuses an isolated Rime session, avoiding repeated session
+creation and leaving the user's active composition untouched. If that session
+cannot reproduce the active schema option state, the package falls back to its
+original default-session query.
+
+### Evaluation
+
+With `luna_pinyin` and a 100-candidate limit:
+
+| Implementation | Regexp construction | Generated regexp |
+| --- | ---: | ---: |
+| Reused session + librime `set_input` | 1.8–5.5× faster | byte-for-byte identical |
+
+The optimization retains user dictionaries, automatic commits, schema output
+filters, and the existing prefix/remainder recursion. Equivalence runs covered
+519 Pinyin codes, 126 Cangjie codes, and 40 Stroke codes without a single
+candidate-structure difference. Representative final regexps were also
+byte-for-byte identical.
+
+## Chinese word segmentation
+
+`liberime-regexp-segment` returns zero-based word bounds, in the same shape as
+EMT/ewt-rs:
+
+```elisp
+(liberime-regexp-segment "我愛北京天安門")
+;; => ((0 . 2) (2 . 4) (4 . 7))
+
+(liberime-regexp-split-string "我愛北京天安門")
+;; => ("我愛" "北京" "天安門")
+```
+
+The exact result depends on the active Rime schema and its dictionaries. The
+segmenter constructs one weighted word graph for each Han run and selects its
+maximum-weight path. This excludes sentences synthesized by Rime from smaller
+words. Single Han characters are used as a fallback.
+
+Enable Rime-aware word commands separately from search expansion:
+
+```elisp
+(liberime-regexp-segment-mode 1)
+```
+
+This remaps `forward-word`, `backward-word`, `kill-word`,
+`backward-kill-word`, and `mark-word`. Ordinary non-Chinese words continue to
+use Emacs's built-in word motion.
+
+By default, Emacs's built-in simplified and traditional Chinese Pinyin tables
+are used to generate full-Pinyin Rime codes. The active schema must accept
+full Pinyin, and its output variant should match the text being segmented. For
+double-Pinyin or shape-based schemas, set
+`liberime-regexp-segment-code-function` to a function which receives a Chinese
+substring and returns its possible Rime codes.
+
 ## Options
 
 Customize these variables with `M-x customize-group RET liberime-regexp` or
@@ -44,8 +113,18 @@ set them in your Emacs configuration.
 | `liberime-regexp-candidate-limit` | `100` | Maximum candidates examined for one code. `nil` or a non-positive value means no limit. |
 | `liberime-regexp-cache-size` | `256` | Maximum number of cached queries. A non-positive value disables caching. |
 | `liberime-regexp-omit-code-separators` | `t` | Allow whitespace between adjacent Rime codes to match nothing. |
+| `liberime-regexp-segment-max-word-length` | `6` | Maximum Chinese word length considered during segmentation. |
+| `liberime-regexp-segment-code-limit` | `64` | Maximum Pinyin combinations tried for a substring. |
+| `liberime-regexp-segment-code-function` | `liberime-regexp-segment-pinyin-codes` | Convert a Chinese substring to codes accepted by the active Rime schema. |
+| `liberime-regexp-segment-dictionary-namespace` | `translator` | Schema namespace used to create the librime Dictionary. |
+| `liberime-regexp-segment-context-length` | `32` | Maximum Han context examined on each side of point for word operations. |
+| `liberime-regexp-segment-single-character-weight` | `-12.0` | Fallback graph weight assigned to individual Han characters. |
+| `liberime-regexp-module-file` | `nil` | Optional path to the liberime-regexp native module. |
 
 ## Thanks
 
 Thanks to [`rime-regexp.el`](https://github.com/colawithsauce/rime-regexp.el)
-for the inspiration.
+for the search inspiration. The segmentation API and word commands are based
+on ideas from [pyim](https://github.com/emacs-straight/pyim),
+[EMT](https://github.com/roife/emt), and
+[ewt-rs](https://github.com/Master-Hash/ewt-rs).
