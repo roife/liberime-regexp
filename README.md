@@ -103,8 +103,12 @@ Enable Rime-aware word commands separately from search expansion:
 ```
 
 This remaps `forward-word`, `backward-word`, `kill-word`,
-`backward-kill-word`, and `mark-word`. Ordinary non-Chinese words continue to
-use Emacs's built-in word motion.
+`backward-kill-word`, `mark-word`, and `word-at-point`. Ordinary non-Chinese
+words continue to use Emacs's built-in word handling.
+
+As in EMT, `liberime-regexp-word-at-point-or-forward` and
+`liberime-regexp-word-at-point-or-backward` are interactive commands. At a
+word boundary they choose the word on the named side and return its text.
 
 ## Options
 

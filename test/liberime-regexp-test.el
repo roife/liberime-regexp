@@ -217,6 +217,15 @@
       (should (liberime-regexp-backward-word 2))
       (should (= (point) 2)))))
 
+(ert-deftest liberime-regexp-test-word-at-point-interactive-api ()
+  (should (commandp #'liberime-regexp-word-at-point-or-forward))
+  (should (commandp #'liberime-regexp-word-at-point-or-backward))
+  (cl-letf (((symbol-function 'liberime-regexp-words-at-point)
+             (lambda (&optional backward)
+               (list (list (if backward "左词" "右词") 0 2)))))
+    (should (equal (liberime-regexp-word-at-point-or-forward) "右词"))
+    (should (equal (liberime-regexp-word-at-point-or-backward) "左词"))))
+
 (ert-deftest liberime-regexp-test-native-segmentation-boundaries ()
   (let ((liberime-regexp-segment-code-limit 7)
         (liberime-regexp--segment-cache (make-hash-table :test #'equal))
@@ -242,7 +251,9 @@
           (should (eq (command-remapping 'forward-word)
                       #'liberime-regexp-forward-word))
           (should (eq (command-remapping 'backward-kill-word)
-                      #'liberime-regexp-backward-kill-word)))
+                      #'liberime-regexp-backward-kill-word))
+          (should (eq (command-remapping 'word-at-point)
+                      #'liberime-regexp-word-at-point-or-forward)))
       (liberime-regexp-segment-mode -1))))
 
 (provide 'liberime-regexp-test)

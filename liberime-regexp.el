@@ -40,6 +40,7 @@
 (require 'cl-lib)
 (require 'isearch)
 (require 'subr-x)
+(require 'thingatpt)
 
 (declare-function liberime-load "liberime")
 (declare-function liberime-workable-p "liberime")
@@ -604,12 +605,30 @@ after point by default; when BACKWARD is non-nil, use the word before point."
                     (- point-offset (car bounds))
                     (- (cdr bounds) point-offset)))))))
 
+(defun liberime-regexp--word-at-point (backward)
+  "Return the Rime word at point, preferring the BACKWARD side at a boundary."
+  (or (caar (liberime-regexp-words-at-point backward))
+      (thing-at-point 'word t)))
+
+;;;###autoload
+(defun liberime-regexp-word-at-point-or-forward ()
+  "Return the word at point, choosing the forward word at a boundary."
+  (interactive)
+  (liberime-regexp--word-at-point nil))
+
+;;;###autoload
+(defun liberime-regexp-word-at-point-or-backward ()
+  "Return the word at point, choosing the backward word at a boundary."
+  (interactive)
+  (liberime-regexp--word-at-point t))
+
 (defun liberime-regexp--longest-distance (words index)
   "Return the greatest non-negative distance at INDEX in WORDS."
   (let ((distance 0))
     (dolist (word words distance)
       (setq distance (max distance (max 0 (nth index word)))))))
 
+;;;###autoload
 (defun liberime-regexp-forward-word (&optional arg)
   "Move forward ARG Chinese or ordinary words.
 
@@ -634,6 +653,7 @@ backward when ARG is negative."
           (setq count (1+ count))))
       (= count arg))))
 
+;;;###autoload
 (defun liberime-regexp-backward-word (&optional arg)
   "Move backward ARG Chinese or ordinary words.
 
@@ -658,6 +678,7 @@ forward when ARG is negative."
           (setq count (1+ count))))
       (= count arg))))
 
+;;;###autoload
 (defun liberime-regexp-kill-word (arg)
   "Kill ARG words forward, using Rime for Chinese word boundaries."
   (interactive "p")
@@ -666,11 +687,13 @@ forward when ARG is negative."
                  (liberime-regexp-forward-word arg)
                  (point))))
 
+;;;###autoload
 (defun liberime-regexp-backward-kill-word (arg)
   "Kill ARG words backward, using Rime for Chinese word boundaries."
   (interactive "p")
   (liberime-regexp-kill-word (- arg)))
 
+;;;###autoload
 (defun liberime-regexp-mark-word (&optional arg)
   "Mark ARG words, using Rime for Chinese word boundaries."
   (interactive "p")
@@ -843,6 +866,8 @@ ARG reverses the value of `avy-all-windows'."
                 #'liberime-regexp-backward-kill-word)
     (define-key map [remap mark-word]
                 #'liberime-regexp-mark-word)
+    (define-key map [remap word-at-point]
+                #'liberime-regexp-word-at-point-or-forward)
     map)
   "Keymap for `liberime-regexp-segment-mode'.")
 
