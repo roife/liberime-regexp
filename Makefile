@@ -29,7 +29,7 @@ endif
 .PHONY: all clean
 all: $(TARGET)
 
-$(TARGET): $(SOURCE)
+$(TARGET): $(SOURCE) Makefile
 	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) -o $@
 
 clean:

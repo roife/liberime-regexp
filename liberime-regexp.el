@@ -71,7 +71,10 @@
   :prefix "liberime-regexp-")
 
 (defconst liberime-regexp--directory
-  (file-name-directory (or load-file-name buffer-file-name))
+  (let* ((file (or load-file-name buffer-file-name))
+         (source (concat (file-name-sans-extension file) ".el")))
+    (file-name-directory
+     (file-truename (if (file-exists-p source) source file))))
   "Directory containing the liberime-regexp package.")
 
 (defcustom liberime-regexp-max-code-length 0
@@ -412,24 +415,28 @@ preedit for a prefix candidate."
   (interactive)
   (unless module-file-suffix
     (user-error "This Emacs does not support dynamic modules"))
-  (let ((buffer (get-buffer-create "*liberime-regexp build*")))
+  (let ((buffer (get-buffer-create "*liberime-regexp build*"))
+        (default-directory liberime-regexp--directory))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer))
       (setq buffer-read-only nil))
-    (unless
-        (equal 0
+    (let ((status
+           (unwind-protect
                (call-process
-                "make" nil buffer t "-C" liberime-regexp--directory
+                "make" nil buffer t
                 (concat "SUFFIX=" module-file-suffix)
                 (concat
                  "EMACS_INCLUDE="
                  (expand-file-name
                   "include"
                   (replace-regexp-in-string
-                   "/share/emacs/.*" "" (locate-library "files"))))))
-      (display-buffer buffer)
-      (user-error "Failed to build liberime-regexp-core"))
+                   "/share/emacs/.*" "" (locate-library "files")))))
+             (with-current-buffer buffer
+               (setq buffer-read-only t)))))
+      (unless (equal status 0)
+        (display-buffer buffer)
+        (user-error "Failed to build liberime-regexp-core")))
     (unless (liberime-regexp--try-load-native-module)
       (user-error "Built liberime-regexp-core but could not load it"))
     (message "liberime-regexp: native module built")))

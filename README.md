@@ -32,9 +32,11 @@ make RIME_PATH=/path/to/librime-source BOOST_INCLUDE=/path/to/boost/include
 ```
 
 Set `RIME_INTERNAL_CXXFLAGS` when librime's internal dependency headers are in
-non-standard locations. Alternatively, point `liberime-regexp-module-file` at
-an already-built `liberime-regexp-core` module. Search still works without the
-module by falling back to Liberime's ordinary candidate-search binding.
+non-standard locations. As with Liberime, `RIME_PATH` and the other build
+variables are read from the environment. Alternatively, point
+`liberime-regexp-module-file` at an already-built `liberime-regexp-core`
+module. Search still works without the module by falling back to Liberime's
+ordinary candidate-search binding.
 
 Missing modules are built automatically. Run `M-x liberime-regexp-build` to
 build explicitly, or disable automatic builds before loading the package:
@@ -42,6 +44,10 @@ build explicitly, or disable automatic builds before loading the package:
 ```elisp
 (setq liberime-regexp-auto-build nil)
 ```
+
+For a graphical Emacs, set the same build environment in Emacs before the
+package is loaded, for example with `setenv`. The actual paths depend on the
+platform and librime installation.
 
 ## Avy
 
