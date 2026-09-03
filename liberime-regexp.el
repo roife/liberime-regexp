@@ -146,6 +146,11 @@ non-positive value means no limit."
   :type '(choice (const nil) file)
   :group 'liberime-regexp)
 
+(defcustom liberime-regexp-auto-build t
+  "Whether to build the native module when it is missing."
+  :type 'boolean
+  :group 'liberime-regexp)
+
 (defconst liberime-regexp--code-pattern "[a-z][a-z']*"
   "Regexp matching a Rime code embedded in a search string.")
 
@@ -401,10 +406,40 @@ preedit for a prefix candidate."
       (require 'liberime-regexp-core nil t)))
   (featurep 'liberime-regexp-core))
 
+;;;###autoload
+(defun liberime-regexp-build ()
+  "Build and load the liberime-regexp native module."
+  (interactive)
+  (unless module-file-suffix
+    (user-error "This Emacs does not support dynamic modules"))
+  (let ((buffer (get-buffer-create "*liberime-regexp build*")))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer))
+      (setq buffer-read-only nil))
+    (unless
+        (equal 0
+               (call-process
+                "make" nil buffer t "-C" liberime-regexp--directory
+                (concat "SUFFIX=" module-file-suffix)
+                (concat
+                 "EMACS_INCLUDE="
+                 (expand-file-name
+                  "include"
+                  (replace-regexp-in-string
+                   "/share/emacs/.*" "" (locate-library "files"))))))
+      (display-buffer buffer)
+      (user-error "Failed to build liberime-regexp-core"))
+    (unless (liberime-regexp--try-load-native-module)
+      (user-error "Built liberime-regexp-core but could not load it"))
+    (message "liberime-regexp: native module built")))
+
 (defun liberime-regexp-load-native-module ()
   "Load the native candidate-query and static-dictionary module."
-  (unless (liberime-regexp--try-load-native-module)
-    (user-error "Build liberime-regexp-core with make first")))
+  (unless (or (liberime-regexp--try-load-native-module)
+              (and liberime-regexp-auto-build
+                   (liberime-regexp-build)))
+    (user-error "Cannot load liberime-regexp-core")))
 
 (defun liberime-regexp--query-code (str &optional preserve-separators)
   "Return cached candidate expansion data for Rime code STR.
@@ -969,6 +1004,14 @@ ARG reverses the value of `avy-all-windows'."
 (defun liberime-regexp-enable ()
   "Enable `liberime-regexp-mode'."
   (liberime-regexp-mode 1))
+
+(condition-case error-data
+    (liberime-regexp-load-native-module)
+  (error
+   (display-warning
+    'liberime-regexp
+    (format "Unable to prepare the native module: %s"
+            (error-message-string error-data)))))
 
 (provide 'liberime-regexp)
 

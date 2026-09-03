@@ -36,6 +36,13 @@ non-standard locations. Alternatively, point `liberime-regexp-module-file` at
 an already-built `liberime-regexp-core` module. Search still works without the
 module by falling back to Liberime's ordinary candidate-search binding.
 
+Missing modules are built automatically. Run `M-x liberime-regexp-build` to
+build explicitly, or disable automatic builds before loading the package:
+
+```elisp
+(setq liberime-regexp-auto-build nil)
+```
+
 ## Avy
 
 Enable Rime expansion for Avy's character commands:
@@ -132,6 +139,7 @@ set them in your Emacs configuration.
 | `liberime-regexp-segment-context-length` | `32` | Maximum Han context examined on each side of point for word operations. |
 | `liberime-regexp-segment-single-character-weight` | `-12.0` | Fallback graph weight assigned to individual Han characters. |
 | `liberime-regexp-module-file` | `nil` | Optional path to the liberime-regexp native module. |
+| `liberime-regexp-auto-build` | `t` | Build the native module automatically when it is missing. |
 
 ## Thanks
 

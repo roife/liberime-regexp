@@ -6,6 +6,19 @@
 (require 'cl-lib)
 (require 'liberime-regexp)
 
+(ert-deftest liberime-regexp-test-load-native-module-auto-build-option ()
+  (dolist (auto-build '(nil t))
+    (let ((liberime-regexp-auto-build auto-build)
+          built)
+      (cl-letf (((symbol-function 'liberime-regexp--try-load-native-module)
+                 (lambda () nil))
+                ((symbol-function 'liberime-regexp-build)
+                 (lambda () (setq built t))))
+        (if auto-build
+            (liberime-regexp-load-native-module)
+          (should-error (liberime-regexp-load-native-module)))
+        (should (eq built auto-build))))))
+
 (ert-deftest liberime-regexp-test-keeps-shortest-prefix-group ()
   (let* ((contexts
           (vector
