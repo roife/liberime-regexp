@@ -24,19 +24,22 @@ With `straight.el` and `use-package`:
 ```
 
 The `set_input` search optimization and Chinese segmentation use this
-package's native module. Build it against the same librime version installed
-on the system:
+package's native module. The matching librime sources are included as a Git
+submodule, while the resulting module links to the system librime used by
+Liberime. Building from a Git checkout initializes and updates the submodule
+to the commit recorded by this repository automatically:
 
 ```sh
-make RIME_PATH=/path/to/librime-source BOOST_INCLUDE=/path/to/boost/include
+make
 ```
 
-Set `RIME_INTERNAL_CXXFLAGS` when librime's internal dependency headers are in
-non-standard locations. As with Liberime, `RIME_PATH` and the other build
-variables are read from the environment. Alternatively, point
-`liberime-regexp-module-file` at an already-built `liberime-regexp-core`
-module. Search still works without the module by falling back to Liberime's
-ordinary candidate-search binding.
+The build fails early if the installed librime version differs from the
+submodule version. Override `RIME_PATH`, `BOOST_INCLUDE`, or
+`RIME_INTERNAL_CXXFLAGS` when using another matching source tree or when
+dependency headers are in non-standard locations. Alternatively, point
+`liberime-regexp-module-file` at an already-built module. Search still works
+without the module by falling back to Liberime's ordinary candidate-search
+binding.
 
 Missing modules are built automatically. Run `M-x liberime-regexp-build` to
 build explicitly, or disable automatic builds before loading the package:
@@ -45,9 +48,8 @@ build explicitly, or disable automatic builds before loading the package:
 (setq liberime-regexp-auto-build nil)
 ```
 
-For a graphical Emacs, set the same build environment in Emacs before the
-package is loaded, for example with `setenv`. The actual paths depend on the
-platform and librime installation.
+Source archives and package managers without Git metadata must include
+`vendor/librime` in the installed package for automatic building to work.
 
 ## Avy
 

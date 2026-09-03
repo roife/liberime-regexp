@@ -1,0 +1,4 @@
+[submodule "vendor/librime"]
+	path = vendor/librime
+	url = https://github.com/rime/librime.git
+	shallow = true
