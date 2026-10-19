@@ -140,8 +140,9 @@ which contains the original separator can still match."
     (cons schema options)))
 
 (defun liberime-regexp-clear-cache ()
-  "Clear cached Rime candidate queries."
+  "Clear cached Rime candidate queries and segmentation results."
   (interactive)
+  (liberime-regexp--segment-clear-cache)
   (clrhash liberime-regexp--candidate-cache)
   (setq liberime-regexp--cache-order
         (make-ring (max 1 liberime-regexp-cache-size))))
@@ -152,6 +153,33 @@ which contains the original separator can still match."
     (liberime-session-destroy liberime-regexp--query-session)
     (setq liberime-regexp--query-session nil)))
 
+(defun liberime-regexp--session-schema (session)
+  "Return the schema of SESSION, or nil if it is absent or expired."
+  (and session
+       (alist-get 'schema_id (condition-case nil
+                                 (liberime-get-status session)
+                               (rimeerr nil)))))
+
+(defun liberime-regexp--cache-get (table key)
+  "Return the value of KEY in cache TABLE, or `liberime-regexp--unset'."
+  (if (> liberime-regexp-cache-size 0)
+      (gethash key table liberime-regexp--unset)
+    liberime-regexp--unset))
+
+(defun liberime-regexp--cache-put (table order key value)
+  "Store KEY and VALUE in TABLE, evicting the oldest keys in ring ORDER.
+Return VALUE.  Nothing is stored when caching is disabled."
+  (when (> liberime-regexp-cache-size 0)
+    (unless (= (ring-size order) liberime-regexp-cache-size)
+      (dolist (key (nthcdr liberime-regexp-cache-size (ring-elements order)))
+        (remhash key table))
+      (ring-resize order liberime-regexp-cache-size))
+    (when (= (ring-length order) liberime-regexp-cache-size)
+      (remhash (ring-ref order -1) table))
+    (ring-insert order key)
+    (puthash key value table))
+  value)
+
 (defun liberime-regexp--reset-rime-state ()
   "Discard state retained from a previous Rime instance."
   ;; Old session ids may have been recycled for the new default session.
@@ -161,15 +189,12 @@ which contains the original separator can still match."
 
 (defun liberime-regexp--batch-session-query (code limit state)
   "Query CODE with LIMIT candidates in a session synchronized with STATE."
-  (let ((status (and liberime-regexp--query-session
-                     (condition-case nil
-                         (liberime-get-status liberime-regexp--query-session)
-                       (rimeerr nil)))))
-    ;; Rime expires idle sessions; a schema change also needs a new session.
-    (unless (equal (car state) (alist-get 'schema_id status))
-      (liberime-regexp--destroy-query-session)
-      (setq liberime-regexp--query-session
-            (liberime-session-create (car state)))))
+  ;; Rime expires idle sessions; a schema change also needs a new session.
+  (unless (equal (car state)
+                 (liberime-regexp--session-schema liberime-regexp--query-session))
+    (liberime-regexp--destroy-query-session)
+    (setq liberime-regexp--query-session
+          (liberime-session-create (car state))))
   (dolist (option (cdr state))
     (liberime-set-option (car option) (cdr option)
                          liberime-regexp--query-session))
@@ -213,28 +238,13 @@ Return nil if STR is invalid, too long according to
                          (> liberime-regexp-candidate-limit 0)
                          liberime-regexp-candidate-limit))
              (key (list code limit state))
-             (cached (if (> liberime-regexp-cache-size 0)
-                         (gethash key liberime-regexp--candidate-cache
-                                  liberime-regexp--unset)
-                       liberime-regexp--unset)))
+             (cached (liberime-regexp--cache-get
+                      liberime-regexp--candidate-cache key)))
         (if (not (eq cached liberime-regexp--unset))
             cached
-          (let ((result (liberime-regexp--batch-session-query code limit state)))
-            (when (> liberime-regexp-cache-size 0)
-              (unless (= (ring-size liberime-regexp--cache-order)
-                         liberime-regexp-cache-size)
-                (dolist (key (nthcdr liberime-regexp-cache-size
-                                    (ring-elements liberime-regexp--cache-order)))
-                  (remhash key liberime-regexp--candidate-cache))
-                (ring-resize liberime-regexp--cache-order
-                             liberime-regexp-cache-size))
-              (when (= (ring-length liberime-regexp--cache-order)
-                       liberime-regexp-cache-size)
-                (remhash (ring-ref liberime-regexp--cache-order -1)
-                         liberime-regexp--candidate-cache))
-              (ring-insert liberime-regexp--cache-order key)
-              (puthash key result liberime-regexp--candidate-cache))
-            result))))))
+          (liberime-regexp--cache-put
+           liberime-regexp--candidate-cache liberime-regexp--cache-order key
+           (liberime-regexp--batch-session-query code limit state)))))))
 
 (defun liberime-regexp-get-candidates-list (str)
   "Return the Rime commit and full-consumption candidates for code STR.
@@ -501,6 +511,8 @@ ARG reverses the value of `avy-all-windows'."
 (defun liberime-regexp-enable ()
   "Enable `liberime-regexp-mode'."
   (liberime-regexp-mode 1))
+
+(require 'liberime-regexp-segment)
 
 (provide 'liberime-regexp)
 
