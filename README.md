@@ -6,7 +6,8 @@ built-in `isearch` and Avy, and integrates with Orderless and Evil search when
 they are available.
 
 Requirements: Emacs 27.1 or newer, [Avy](https://github.com/abo-abo/avy) 0.5.0
-or newer, and [liberime](https://github.com/emacs-rime/liberime) 0.0.7 or newer.
+or newer, and [liberime](https://github.com/emacs-rime/liberime) 0.0.11 or newer,
+with full-context search and session APIs.
 
 ## Installation
 
@@ -42,8 +43,11 @@ set them in your Emacs configuration.
 | --- | ---: | --- |
 | `liberime-regexp-max-code-length` | `0` | Maximum code length to expand. `0` means no limit. |
 | `liberime-regexp-candidate-limit` | `100` | Maximum candidates examined for one code. `nil` or a non-positive value means no limit. |
-| `liberime-regexp-cache-size` | `256` | Maximum number of cached queries. A non-positive value disables caching. |
+| `liberime-regexp-cache-size` | `256` | Maximum number of cached queries, with oldest entries evicted first. A non-positive value disables caching. |
 | `liberime-regexp-omit-code-separators` | `t` | Allow whitespace between adjacent Rime codes to match nothing. |
+
+Candidate lookup reuses a separate session synchronized with the active
+schema and its switch options, leaving the current composition untouched.
 
 ## Thanks
 
